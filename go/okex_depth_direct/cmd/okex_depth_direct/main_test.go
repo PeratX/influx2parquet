@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestHumanBytes(t *testing.T) {
 	tests := []struct {
@@ -36,5 +39,54 @@ func TestHumanProgress(t *testing.T) {
 		if got := humanProgress(tt.current, tt.total); got != tt.want {
 			t.Fatalf("humanProgress(%d, %d) = %q, want %q", tt.current, tt.total, got, tt.want)
 		}
+	}
+}
+
+func TestResolveWorkLayoutDefaults(t *testing.T) {
+	cfg := config{OutputDir: "/tmp/out"}
+	layout, err := resolveWorkLayout(cfg)
+	if err != nil {
+		t.Fatalf("resolveWorkLayout() error = %v", err)
+	}
+	if got, want := layout.MetaRoot, filepath.Join("/tmp/out", measurement); got != want {
+		t.Fatalf("MetaRoot = %q, want %q", got, want)
+	}
+	if got, want := layout.RawRoot, filepath.Join(layout.MetaRoot, rawDirName); got != want {
+		t.Fatalf("RawRoot = %q, want %q", got, want)
+	}
+	if got, want := layout.MergedRoot, filepath.Join(layout.MetaRoot, mergedDirName); got != want {
+		t.Fatalf("MergedRoot = %q, want %q", got, want)
+	}
+	if got, want := layout.BuildRoot, filepath.Join(layout.MetaRoot, buildDirName); got != want {
+		t.Fatalf("BuildRoot = %q, want %q", got, want)
+	}
+	if got, want := layout.FinalRoot, layout.MetaRoot; got != want {
+		t.Fatalf("FinalRoot = %q, want %q", got, want)
+	}
+}
+
+func TestResolveWorkLayoutSplitRoots(t *testing.T) {
+	cfg := config{
+		OutputDir: "/tmp/meta",
+		RawDir:    "/mnt/rawdisk",
+		MergedDir: "/mnt/mergeddisk",
+		BuildDir:  "/mnt/builddisk",
+		FinalDir:  "/mnt/finaldisk",
+	}
+	layout, err := resolveWorkLayout(cfg)
+	if err != nil {
+		t.Fatalf("resolveWorkLayout() error = %v", err)
+	}
+	if got, want := layout.RawRoot, filepath.Join("/mnt/rawdisk", measurement, rawDirName); got != want {
+		t.Fatalf("RawRoot = %q, want %q", got, want)
+	}
+	if got, want := layout.MergedRoot, filepath.Join("/mnt/mergeddisk", measurement, mergedDirName); got != want {
+		t.Fatalf("MergedRoot = %q, want %q", got, want)
+	}
+	if got, want := layout.BuildRoot, filepath.Join("/mnt/builddisk", measurement, buildDirName); got != want {
+		t.Fatalf("BuildRoot = %q, want %q", got, want)
+	}
+	if got, want := layout.FinalRoot, filepath.Join("/mnt/finaldisk", measurement); got != want {
+		t.Fatalf("FinalRoot = %q, want %q", got, want)
 	}
 }

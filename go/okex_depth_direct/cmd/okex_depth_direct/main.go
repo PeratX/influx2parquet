@@ -72,6 +72,10 @@ type config struct {
 	DataDir                      string
 	WALDir                       string
 	OutputDir                    string
+	RawDir                       string
+	MergedDir                    string
+	BuildDir                     string
+	FinalDir                     string
 	Start                        string
 	End                          string
 	StartNS                      int64
@@ -86,6 +90,14 @@ type config struct {
 	ProgressInterval             time.Duration
 	Overwrite                    bool
 	StopAfter                    string
+}
+
+type workLayout struct {
+	MetaRoot   string
+	RawRoot    string
+	MergedRoot string
+	BuildRoot  string
+	FinalRoot  string
 }
 
 type influxTree struct {
@@ -165,6 +177,11 @@ type pipelineMeta struct {
 	InstIDs                 []string `json:"inst_ids"`
 	IntermediateFormat      string   `json:"intermediate_format"`
 	IntermediateCompression string   `json:"intermediate_compression"`
+	MetaRoot                string   `json:"meta_root"`
+	RawRoot                 string   `json:"raw_root"`
+	MergedRoot              string   `json:"merged_root"`
+	BuildRoot               string   `json:"build_root"`
+	FinalRoot               string   `json:"final_root"`
 	ScanIndexPath           string   `json:"scan_index_path"`
 }
 
@@ -316,8 +333,11 @@ func run() error {
 		return err
 	}
 
-	root := measurementRoot(cfg.OutputDir)
-	if err := ensureRoot(root, cfg.Overwrite); err != nil {
+	paths, err := resolveWorkLayout(cfg)
+	if err != nil {
+		return err
+	}
+	if err := ensureRoot(paths, cfg.Overwrite); err != nil {
 		return err
 	}
 
@@ -330,12 +350,12 @@ func run() error {
 		return err
 	}
 
-	index, err := loadScanIndex(root)
+	index, err := loadScanIndex(paths.MetaRoot)
 	if err != nil {
 		return err
 	}
 	if !index.ScanComplete {
-		return fmt.Errorf("existing scan index is not complete: %s", scanIndexPath(root))
+		return fmt.Errorf("existing scan index is not complete: %s", scanIndexPath(paths.MetaRoot))
 	}
 
 	targetInstIDs, err := determineTargetInstIDs(index.InstIDs, cfg.InstIDs)
@@ -353,7 +373,7 @@ func run() error {
 	sources := append(tsmSources, walSources...)
 	sort.Slice(sources, func(i, j int) bool { return sourceLess(sources[i], sources[j]) })
 
-	state, err := ensureState(root, cfg, dataTree, walTree, targetInstIDs, sources)
+	state, err := ensureState(paths, cfg, dataTree, walTree, targetInstIDs, sources)
 	if err != nil {
 		return err
 	}
@@ -365,14 +385,21 @@ func run() error {
 		len(walSources),
 		max(1, cfg.Workers),
 		max(1, cfg.BuildWorkers),
-		root,
+		paths.MetaRoot,
+	)
+	fmt.Printf(
+		"[workspace] raw=%s merged=%s build=%s final=%s\n",
+		paths.RawRoot,
+		paths.MergedRoot,
+		paths.BuildRoot,
+		paths.FinalRoot,
 	)
 	fmt.Printf(
 		"[scan] already-complete files=%d/%d matched_size=%s index=%s\n",
 		index.MatchedTSMFiles,
 		index.TotalTSMFiles,
 		humanBytes(index.MatchedTSMBytes),
-		scanIndexPath(root),
+		scanIndexPath(paths.MetaRoot),
 	)
 	if cfg.StopAfter == "scan" {
 		fmt.Println("[stop] after scan")
@@ -388,7 +415,7 @@ func run() error {
 		walTree.Layout,
 	)
 
-	if err := runExportPhase(root, cfg, state, targetInstIDs, sources); err != nil {
+	if err := runExportPhase(paths, cfg, state, targetInstIDs, sources); err != nil {
 		return err
 	}
 	if cfg.StopAfter == "export" {
@@ -396,7 +423,7 @@ func run() error {
 		return nil
 	}
 
-	if err := runMergePhase(root, cfg, state, targetInstIDs); err != nil {
+	if err := runMergePhase(paths, cfg, state, targetInstIDs); err != nil {
 		return err
 	}
 	if cfg.StopAfter == "merge" {
@@ -404,11 +431,11 @@ func run() error {
 		return nil
 	}
 
-	if err := runBuildPhase(root, cfg, state, targetInstIDs); err != nil {
+	if err := runBuildPhase(paths, cfg, state, targetInstIDs); err != nil {
 		return err
 	}
 
-	fmt.Printf("[done] measurement=%s inst_ids=%d output=%s\n", measurement, len(targetInstIDs), root)
+	fmt.Printf("[done] measurement=%s inst_ids=%d meta=%s final=%s\n", measurement, len(targetInstIDs), paths.MetaRoot, paths.FinalRoot)
 	return nil
 }
 
@@ -422,7 +449,11 @@ func parseConfig() (config, error) {
 	fs.StringVar(&cfg.Retention, "retention", defaultRetention, "InfluxDB retention policy")
 	fs.StringVar(&cfg.DataDir, "data-dir", "/opt/my_influx/data", "InfluxDB data root or database root")
 	fs.StringVar(&cfg.WALDir, "wal-dir", "/opt/my_influx/wal", "InfluxDB wal root or database root")
-	fs.StringVar(&cfg.OutputDir, "output-dir", "direct_exports", "Base output directory")
+	fs.StringVar(&cfg.OutputDir, "output-dir", "direct_exports", "Metadata root and default final output root")
+	fs.StringVar(&cfg.RawDir, "raw-dir", "", "Optional base directory for export intermediates; defaults under --output-dir")
+	fs.StringVar(&cfg.MergedDir, "merged-dir", "", "Optional base directory for merged intermediates; defaults under --output-dir")
+	fs.StringVar(&cfg.BuildDir, "build-dir", "", "Optional base directory for build staging outputs; defaults under --output-dir")
+	fs.StringVar(&cfg.FinalDir, "final-dir", "", "Optional base directory for final parquet datasets; defaults under --output-dir")
 	fs.StringVar(&cfg.Start, "start", defaultStart, "Inclusive RFC3339 UTC start timestamp")
 	fs.StringVar(&cfg.End, "end", defaultEnd, "Exclusive RFC3339 UTC end timestamp")
 	fs.Var(&instIDs, "instid", "Optional instId filter; repeat to limit export")
@@ -468,6 +499,52 @@ func parseRFC3339Nano(text string) (int64, error) {
 		return 0, err
 	}
 	return t.UTC().UnixNano(), nil
+}
+
+func resolveWorkLayout(cfg config) (workLayout, error) {
+	metaBase, err := filepath.Abs(cfg.OutputDir)
+	if err != nil {
+		return workLayout{}, err
+	}
+	layout := workLayout{
+		MetaRoot: measurementRoot(metaBase),
+	}
+
+	if layout.RawRoot, err = resolvePhaseRoot(cfg.RawDir, layout.MetaRoot, rawDirName); err != nil {
+		return workLayout{}, err
+	}
+	if layout.MergedRoot, err = resolvePhaseRoot(cfg.MergedDir, layout.MetaRoot, mergedDirName); err != nil {
+		return workLayout{}, err
+	}
+	if layout.BuildRoot, err = resolvePhaseRoot(cfg.BuildDir, layout.MetaRoot, buildDirName); err != nil {
+		return workLayout{}, err
+	}
+	if layout.FinalRoot, err = resolveFinalRoot(cfg.FinalDir, layout.MetaRoot); err != nil {
+		return workLayout{}, err
+	}
+	return layout, nil
+}
+
+func resolvePhaseRoot(baseDir, defaultMetaRoot, leaf string) (string, error) {
+	if strings.TrimSpace(baseDir) == "" {
+		return filepath.Join(defaultMetaRoot, leaf), nil
+	}
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(measurementRoot(absBase), leaf), nil
+}
+
+func resolveFinalRoot(baseDir, defaultMetaRoot string) (string, error) {
+	if strings.TrimSpace(baseDir) == "" {
+		return defaultMetaRoot, nil
+	}
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", err
+	}
+	return measurementRoot(absBase), nil
 }
 
 func resolveInfluxTree(rootDir, database, retention string) (influxTree, error) {
@@ -649,29 +726,29 @@ func determineTargetInstIDs(discovered, requested []string) ([]string, error) {
 	return dedupSortedStrings(requested), nil
 }
 
-func ensureRoot(root string, overwrite bool) error {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+func ensureRoot(paths workLayout, overwrite bool) error {
+	if err := os.MkdirAll(paths.MetaRoot, 0o755); err != nil {
 		return err
 	}
 	if overwrite {
-		for _, path := range []string{rawRoot(root), mergedRoot(root), buildRoot(root), statePath(root)} {
+		for _, path := range []string{paths.RawRoot, paths.MergedRoot, paths.BuildRoot, statePath(paths.MetaRoot)} {
 			if err := os.RemoveAll(path); err != nil {
 				return err
 			}
 		}
-		entries, err := os.ReadDir(root)
+		entries, err := os.ReadDir(paths.FinalRoot)
 		if err != nil {
 			return err
 		}
 		for _, entry := range entries {
 			if entry.IsDir() && strings.HasSuffix(entry.Name(), ".parquet") {
-				if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+				if err := os.RemoveAll(filepath.Join(paths.FinalRoot, entry.Name())); err != nil {
 					return err
 				}
 			}
 		}
 	}
-	for _, path := range []string{rawRoot(root), mergedRoot(root), buildRoot(root)} {
+	for _, path := range []string{paths.RawRoot, paths.MergedRoot, paths.BuildRoot, paths.FinalRoot} {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			return err
 		}
@@ -679,7 +756,7 @@ func ensureRoot(root string, overwrite bool) error {
 	return nil
 }
 
-func ensureState(root string, cfg config, dataTree, walTree influxTree, targetInstIDs []string, sources []sourceRef) (*pipelineState, error) {
+func ensureState(paths workLayout, cfg config, dataTree, walTree influxTree, targetInstIDs []string, sources []sourceRef) (*pipelineState, error) {
 	meta := pipelineMeta{
 		PipelineVersion:         goPipelineVersion,
 		PipelineName:            "okex_depth_direct_go",
@@ -700,9 +777,14 @@ func ensureState(root string, cfg config, dataTree, walTree influxTree, targetIn
 		InstIDs:                 append([]string(nil), targetInstIDs...),
 		IntermediateFormat:      "okex_depth_spool_v1",
 		IntermediateCompression: "zstd",
-		ScanIndexPath:           scanIndexPath(root),
+		MetaRoot:                paths.MetaRoot,
+		RawRoot:                 paths.RawRoot,
+		MergedRoot:              paths.MergedRoot,
+		BuildRoot:               paths.BuildRoot,
+		FinalRoot:               paths.FinalRoot,
+		ScanIndexPath:           scanIndexPath(paths.MetaRoot),
 	}
-	path := statePath(root)
+	path := statePath(paths.MetaRoot)
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		files := make(map[string]*fileState, len(sources))
 		for _, src := range sources {
@@ -719,12 +801,12 @@ func ensureState(root string, cfg config, dataTree, walTree influxTree, targetIn
 			Merge:     map[string]map[string]mergeFieldState{},
 			Build:     map[string]buildState{},
 		}
-		return state, saveState(root, state)
+		return state, saveState(paths.MetaRoot, state)
 	} else if err != nil {
 		return nil, err
 	}
 
-	state, err := loadState(root)
+	state, err := loadState(paths.MetaRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -746,7 +828,7 @@ func ensureState(root string, cfg config, dataTree, walTree influxTree, targetIn
 	return state, nil
 }
 
-func runExportPhase(root string, cfg config, state *pipelineState, targetInstIDs []string, sources []sourceRef) error {
+func runExportPhase(paths workLayout, cfg config, state *pipelineState, targetInstIDs []string, sources []sourceRef) error {
 	targetSet := make(map[string]struct{}, len(targetInstIDs))
 	for _, instID := range targetInstIDs {
 		targetSet[instID] = struct{}{}
@@ -761,7 +843,7 @@ func runExportPhase(root string, cfg config, state *pipelineState, targetInstIDs
 		selected = append(selected, src)
 		entry := state.Files[src.ID]
 		if entry.ExportStatus == "complete" {
-			if ok, err := exportArtifactComplete(root, src.ID); err == nil && ok {
+			if ok, err := exportArtifactComplete(paths, src.ID); err == nil && ok {
 				continue
 			}
 		}
@@ -783,14 +865,14 @@ func runExportPhase(root string, cfg config, state *pipelineState, targetInstIDs
 		src := src
 		mu.Lock()
 		state.Files[src.ID].ExportStatus = "running"
-		if err := saveState(root, state); err != nil {
+		if err := saveState(paths.MetaRoot, state); err != nil {
 			mu.Unlock()
 			return err
 		}
 		mu.Unlock()
 
 		g.Go(func() error {
-			result, err := exportSource(root, cfg, src, targetSet)
+			result, err := exportSource(paths, cfg, src, targetSet)
 			if err != nil {
 				return fmt.Errorf("export %s: %w", src.ID, err)
 			}
@@ -802,7 +884,7 @@ func runExportPhase(root string, cfg config, state *pipelineState, targetInstIDs
 			entry.ExportBytes = result.BytesRead
 			entry.MinTimeNS = result.MinTimeNS
 			entry.MaxTimeNS = result.MaxTimeNS
-			if err := saveState(root, state); err != nil {
+			if err := saveState(paths.MetaRoot, state); err != nil {
 				return err
 			}
 			completed++
@@ -822,9 +904,9 @@ func runExportPhase(root string, cfg config, state *pipelineState, targetInstIDs
 	return g.Wait()
 }
 
-func exportSource(root string, cfg config, src sourceRef, targetInstIDs map[string]struct{}) (exportManifest, error) {
+func exportSource(paths workLayout, cfg config, src sourceRef, targetInstIDs map[string]struct{}) (exportManifest, error) {
 	started := time.Now()
-	rawDir := filepath.Join(rawRoot(root), src.ID)
+	rawDir := filepath.Join(paths.RawRoot, src.ID)
 	if err := os.RemoveAll(rawDir); err != nil {
 		return exportManifest{}, err
 	}
@@ -917,7 +999,7 @@ func exportSource(root string, cfg config, src sourceRef, targetInstIDs map[stri
 		MaxTimeNS:         maxTimeNS,
 		ElapsedSeconds:    time.Since(started).Seconds(),
 	}
-	if err := saveJSON(rawManifestPath(root, src.ID), manifest); err != nil {
+	if err := saveJSON(rawManifestPath(paths, src.ID), manifest); err != nil {
 		return exportManifest{}, err
 	}
 	return manifest, nil
@@ -1184,8 +1266,8 @@ func dedupeWALValues(records []walValueRecord) []tsm1.Value {
 	return result
 }
 
-func runMergePhase(root string, cfg config, state *pipelineState, targetInstIDs []string) error {
-	sources, err := gatherMergeSources(root, state, targetInstIDs)
+func runMergePhase(paths workLayout, cfg config, state *pipelineState, targetInstIDs []string) error {
+	sources, err := gatherMergeSources(paths, state, targetInstIDs)
 	if err != nil {
 		return err
 	}
@@ -1208,7 +1290,7 @@ func runMergePhase(root string, cfg config, state *pipelineState, targetInstIDs 
 				sourceIDs = append(sourceIDs, item.FileID)
 			}
 			existing := state.Merge[instID][field]
-			destPath := mergedFieldPath(root, instID, field)
+			destPath := mergedFieldPath(paths, instID, field)
 			if existing.Status == "complete" && sameStrings(existing.SourceFiles, sourceIDs) {
 				if len(sourceIDs) == 0 || fileExists(destPath) {
 					completed++
@@ -1236,14 +1318,14 @@ func runMergePhase(root string, cfg config, state *pipelineState, targetInstIDs 
 		fieldState := state.Merge[task.InstID][task.Field]
 		fieldState.Status = "running"
 		state.Merge[task.InstID][task.Field] = fieldState
-		if err := saveState(root, state); err != nil {
+		if err := saveState(paths.MetaRoot, state); err != nil {
 			mu.Unlock()
 			return err
 		}
 		mu.Unlock()
 
 		g.Go(func() error {
-			result, err := mergeSingleField(root, cfg, task.InstID, task.Field, task.Src)
+			result, err := mergeSingleField(paths, cfg, task.InstID, task.Field, task.Src)
 			if err != nil {
 				return fmt.Errorf("merge %s/%s: %w", task.InstID, task.Field, err)
 			}
@@ -1256,7 +1338,7 @@ func runMergePhase(root string, cfg config, state *pipelineState, targetInstIDs 
 				SourceFiles: append([]string(nil), result.SourceFiles...),
 				DestPath:    result.DestPath,
 			}
-			if err := saveState(root, state); err != nil {
+			if err := saveState(paths.MetaRoot, state); err != nil {
 				return err
 			}
 			completed++
@@ -1276,7 +1358,7 @@ func runMergePhase(root string, cfg config, state *pipelineState, targetInstIDs 
 	return g.Wait()
 }
 
-func gatherMergeSources(root string, state *pipelineState, targetInstIDs []string) (map[string]map[string][]sourceFieldFragment, error) {
+func gatherMergeSources(paths workLayout, state *pipelineState, targetInstIDs []string) (map[string]map[string][]sourceFieldFragment, error) {
 	targetSet := make(map[string]struct{}, len(targetInstIDs))
 	for _, instID := range targetInstIDs {
 		targetSet[instID] = struct{}{}
@@ -1294,7 +1376,7 @@ func gatherMergeSources(root string, state *pipelineState, targetInstIDs []strin
 		if entry.ExportStatus != "complete" {
 			continue
 		}
-		manifest, err := loadManifest(root, sourceID)
+		manifest, err := loadManifest(paths, sourceID)
 		if err != nil {
 			return nil, err
 		}
@@ -1334,9 +1416,9 @@ func gatherMergeSources(root string, state *pipelineState, targetInstIDs []strin
 	return result, nil
 }
 
-func mergeSingleField(root string, cfg config, instID, field string, sources []sourceFieldFragment) (mergeResult, error) {
+func mergeSingleField(paths workLayout, cfg config, instID, field string, sources []sourceFieldFragment) (mergeResult, error) {
 	started := time.Now()
-	destPath := mergedFieldPath(root, instID, field)
+	destPath := mergedFieldPath(paths, instID, field)
 	if err := os.RemoveAll(destPath); err != nil {
 		return mergeResult{}, err
 	}
@@ -1456,13 +1538,13 @@ func mergeSingleField(root string, cfg config, instID, field string, sources []s
 	}, nil
 }
 
-func runBuildPhase(root string, cfg config, state *pipelineState, targetInstIDs []string) error {
+func runBuildPhase(paths workLayout, cfg config, state *pipelineState, targetInstIDs []string) error {
 	total := len(targetInstIDs)
 	completed := 0
 	tasks := make([]string, 0, len(targetInstIDs))
 	for _, instID := range targetInstIDs {
 		signature := mergedSignatureForInst(state, instID)
-		finalDataset := filepath.Join(root, instID+".parquet")
+		finalDataset := finalDatasetPath(paths, instID)
 		entry := state.Build[instID]
 		if entry.Status == "complete" &&
 			entry.RowsPerFile == cfg.RowsPerFile &&
@@ -1489,14 +1571,14 @@ func runBuildPhase(root string, cfg config, state *pipelineState, targetInstIDs 
 		entry := state.Build[instID]
 		entry.Status = "running"
 		state.Build[instID] = entry
-		if err := saveState(root, state); err != nil {
+		if err := saveState(paths.MetaRoot, state); err != nil {
 			mu.Unlock()
 			return err
 		}
 		mu.Unlock()
 
 		g.Go(func() error {
-			result, err := buildDataset(root, cfg, state, instID)
+			result, err := buildDataset(paths, cfg, state, instID)
 			if err != nil {
 				return fmt.Errorf("build %s: %w", instID, err)
 			}
@@ -1514,7 +1596,7 @@ func runBuildPhase(root string, cfg config, state *pipelineState, targetInstIDs 
 				Compression:      cfg.Compression,
 				CompressionLevel: cfg.CompressionLevel,
 			}
-			if err := saveState(root, state); err != nil {
+			if err := saveState(paths.MetaRoot, state); err != nil {
 				return err
 			}
 			completed++
@@ -1534,9 +1616,9 @@ func runBuildPhase(root string, cfg config, state *pipelineState, targetInstIDs 
 	return g.Wait()
 }
 
-func buildDataset(root string, cfg config, state *pipelineState, instID string) (buildResult, error) {
+func buildDataset(paths workLayout, cfg config, state *pipelineState, instID string) (buildResult, error) {
 	started := time.Now()
-	stageDataset := filepath.Join(buildRoot(root), instID+".parquet")
+	stageDataset := stageDatasetPath(paths, instID)
 	if err := os.RemoveAll(stageDataset); err != nil {
 		return buildResult{}, err
 	}
@@ -1546,14 +1628,14 @@ func buildDataset(root string, cfg config, state *pipelineState, instID string) 
 
 	existing := map[string]string{}
 	for _, field := range fieldNames {
-		path := mergedFieldPath(root, instID, field)
+			path := mergedFieldPath(paths, instID, field)
 		if fileExists(path) {
 			existing[field] = path
 		}
 	}
 	signature := mergedSignatureForInst(state, instID)
 	if len(existing) == 0 {
-		finalDataset := filepath.Join(root, instID+".parquet")
+		finalDataset := finalDatasetPath(paths, instID)
 		_ = os.RemoveAll(finalDataset)
 		if err := os.Rename(stageDataset, finalDataset); err != nil {
 			return buildResult{}, err
@@ -1645,7 +1727,7 @@ func buildDataset(root string, cfg config, state *pipelineState, instID string) 
 		return buildResult{}, err
 	}
 
-	finalDataset := filepath.Join(root, instID+".parquet")
+	finalDataset := finalDatasetPath(paths, instID)
 	if err := os.RemoveAll(finalDataset); err != nil {
 		return buildResult{}, err
 	}
@@ -1728,6 +1810,24 @@ func loadState(root string) (*pipelineState, error) {
 	if state.Build == nil {
 		state.Build = map[string]buildState{}
 	}
+	if state.Meta.MetaRoot == "" {
+		state.Meta.MetaRoot = root
+	}
+	if state.Meta.RawRoot == "" {
+		state.Meta.RawRoot = filepath.Join(root, rawDirName)
+	}
+	if state.Meta.MergedRoot == "" {
+		state.Meta.MergedRoot = filepath.Join(root, mergedDirName)
+	}
+	if state.Meta.BuildRoot == "" {
+		state.Meta.BuildRoot = filepath.Join(root, buildDirName)
+	}
+	if state.Meta.FinalRoot == "" {
+		state.Meta.FinalRoot = root
+	}
+	if state.Meta.ScanIndexPath == "" {
+		state.Meta.ScanIndexPath = scanIndexPath(root)
+	}
 	return &state, nil
 }
 
@@ -1736,9 +1836,9 @@ func saveState(root string, state *pipelineState) error {
 	return saveJSON(statePath(root), state)
 }
 
-func loadManifest(root, sourceID string) (exportManifest, error) {
+func loadManifest(paths workLayout, sourceID string) (exportManifest, error) {
 	var manifest exportManifest
-	data, err := os.ReadFile(rawManifestPath(root, sourceID))
+	data, err := os.ReadFile(rawManifestPath(paths, sourceID))
 	if err != nil {
 		return manifest, err
 	}
@@ -1760,8 +1860,8 @@ func saveJSON(path string, payload any) error {
 	return os.Rename(tmp, path)
 }
 
-func exportArtifactComplete(root, sourceID string) (bool, error) {
-	manifest, err := loadManifest(root, sourceID)
+func exportArtifactComplete(paths workLayout, sourceID string) (bool, error) {
+	manifest, err := loadManifest(paths, sourceID)
 	if err != nil {
 		return false, err
 	}
@@ -2065,6 +2165,11 @@ func equalMeta(a, b pipelineMeta) bool {
 		a.EndNS == b.EndNS &&
 		a.IntermediateFormat == b.IntermediateFormat &&
 		a.IntermediateCompression == b.IntermediateCompression &&
+		a.MetaRoot == b.MetaRoot &&
+		a.RawRoot == b.RawRoot &&
+		a.MergedRoot == b.MergedRoot &&
+		a.BuildRoot == b.BuildRoot &&
+		a.FinalRoot == b.FinalRoot &&
 		a.ScanIndexPath == b.ScanIndexPath &&
 		sameStrings(a.InstIDs, b.InstIDs)
 }
@@ -2134,20 +2239,23 @@ func mergeSourceLess(a, b sourceFieldFragment) bool {
 	return a.FileID < b.FileID
 }
 
-func rawRoot(root string) string              { return filepath.Join(root, rawDirName) }
-func mergedRoot(root string) string           { return filepath.Join(root, mergedDirName) }
-func buildRoot(root string) string            { return filepath.Join(root, buildDirName) }
-func statePath(root string) string            { return filepath.Join(root, stateFileName) }
-func scanIndexPath(root string) string        { return filepath.Join(root, scanIndexFileName) }
-func measurementRoot(outputDir string) string { return filepath.Join(outputDir, measurement) }
-func rawManifestPath(root, sourceID string) string {
-	return filepath.Join(rawRoot(root), sourceID, "_manifest.json")
+func statePath(metaRoot string) string     { return filepath.Join(metaRoot, stateFileName) }
+func scanIndexPath(metaRoot string) string { return filepath.Join(metaRoot, scanIndexFileName) }
+func measurementRoot(baseDir string) string { return filepath.Join(baseDir, measurement) }
+func rawManifestPath(paths workLayout, sourceID string) string {
+	return filepath.Join(paths.RawRoot, sourceID, "_manifest.json")
 }
 func rawFieldPath(baseDir, instID, field string) string {
 	return filepath.Join(baseDir, instID, field+spoolExt)
 }
-func mergedFieldPath(root, instID, field string) string {
-	return filepath.Join(mergedRoot(root), instID, field+spoolExt)
+func mergedFieldPath(paths workLayout, instID, field string) string {
+	return filepath.Join(paths.MergedRoot, instID, field+spoolExt)
+}
+func stageDatasetPath(paths workLayout, instID string) string {
+	return filepath.Join(paths.BuildRoot, instID+".parquet")
+}
+func finalDatasetPath(paths workLayout, instID string) string {
+	return filepath.Join(paths.FinalRoot, instID+".parquet")
 }
 
 func displaySourcePath(src sourceRef) string {
