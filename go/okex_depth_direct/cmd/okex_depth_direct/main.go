@@ -12,6 +12,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,6 +47,12 @@ const (
 	spoolKindInt64    byte = 2
 	sourceKindTSM          = "tsm"
 	sourceKindWAL          = "wal"
+	// Keep zstd spool streams on a bounded-memory profile. We trade some peak
+	// throughput for predictable RAM usage when a source opens many field
+	// writers concurrently or when merge/build opens many readers at once.
+	spoolZstdWindowSize       = 1 << 20
+	spoolZstdDecoderMaxWindow = 128 << 20
+	spoolZstdDecoderMaxMemory = 256 << 20
 )
 
 var (
@@ -87,6 +95,7 @@ type config struct {
 	IntermediateCompressionLevel int
 	Workers                      int
 	BuildWorkers                 int
+	MaxOpenSpoolWriters          int
 	ProgressInterval             time.Duration
 	Overwrite                    bool
 	StopAfter                    string
@@ -187,11 +196,11 @@ type pipelineMeta struct {
 
 type fileState struct {
 	Source        sourceRef `json:"source"`
-	ExportStatus  string `json:"export_status"`
-	ExportRecords int64  `json:"export_records"`
-	ExportBytes   int64  `json:"export_bytes"`
-	MinTimeNS     *int64 `json:"min_time_ns"`
-	MaxTimeNS     *int64 `json:"max_time_ns"`
+	ExportStatus  string    `json:"export_status"`
+	ExportRecords int64     `json:"export_records"`
+	ExportBytes   int64     `json:"export_bytes"`
+	MinTimeNS     *int64    `json:"min_time_ns"`
+	MaxTimeNS     *int64    `json:"max_time_ns"`
 }
 
 type mergeFieldState struct {
@@ -310,6 +319,31 @@ type exportProgress struct {
 	Every       time.Duration
 }
 
+type mergeProgress struct {
+	InstID       string
+	FieldName    string
+	Rows         int64
+	LogicalBytes int64
+	SourceCount  int
+	LastTimeNS   int64
+	HasLastTime  bool
+	StartedAt    time.Time
+	LastPrinted  time.Time
+	Every        time.Duration
+}
+
+type buildProgress struct {
+	InstID       string
+	Rows         int64
+	PartCount    int
+	BytesWritten int64
+	LastTimeNS   int64
+	HasLastTime  bool
+	StartedAt    time.Time
+	LastPrinted  time.Time
+	Every        time.Duration
+}
+
 type parquetRow struct {
 	Time     int64   `parquet:"time,timestamp(nanosecond:utc)"`
 	InstID   string  `parquet:"instId"`
@@ -379,12 +413,13 @@ func run() error {
 	}
 
 	fmt.Printf(
-		"[plan] matched_tsm=%d matched_tsm_size=%s wal_sources=%d workers=%d build_workers=%d root=%s\n",
+		"[plan] matched_tsm=%d matched_tsm_size=%s wal_sources=%d workers=%d build_workers=%d max_open_writers=%d root=%s\n",
 		len(tsmSources),
 		humanBytes(index.MatchedTSMBytes),
 		len(walSources),
 		max(1, cfg.Workers),
 		max(1, cfg.BuildWorkers),
+		max(1, cfg.MaxOpenSpoolWriters),
 		paths.MetaRoot,
 	)
 	fmt.Printf(
@@ -463,6 +498,7 @@ func parseConfig() (config, error) {
 	fs.IntVar(&cfg.IntermediateCompressionLevel, "intermediate-compression-level", 3, "Intermediate zstd compression level")
 	fs.IntVar(&cfg.Workers, "workers", 1, "Parallel workers for export and merge")
 	fs.IntVar(&cfg.BuildWorkers, "build-workers", 2, "Parallel workers for build")
+	fs.IntVar(&cfg.MaxOpenSpoolWriters, "max-open-spool-writers", 4, "Maximum concurrently-open zstd spool writers per source export")
 	progressSeconds := fs.Int("progress-interval", 5, "Progress print interval in seconds")
 	fs.BoolVar(&cfg.Overwrite, "overwrite", false, "Reset Go export/merge/build state but keep existing scan result")
 	fs.StringVar(&cfg.StopAfter, "stop-after", "", "Optional stop phase: scan, export, merge, build")
@@ -473,6 +509,7 @@ func parseConfig() (config, error) {
 	cfg.InstIDs = dedupSortedStrings(instIDs)
 	cfg.Workers = max(1, cfg.Workers)
 	cfg.BuildWorkers = max(1, cfg.BuildWorkers)
+	cfg.MaxOpenSpoolWriters = max(1, cfg.MaxOpenSpoolWriters)
 	cfg.ProgressInterval = time.Duration(max(1, *progressSeconds)) * time.Second
 	cfg.StartNS, err = parseRFC3339Nano(cfg.Start)
 	if err != nil {
@@ -877,7 +914,6 @@ func runExportPhase(paths workLayout, cfg config, state *pipelineState, targetIn
 				return fmt.Errorf("export %s: %w", src.ID, err)
 			}
 			mu.Lock()
-			defer mu.Unlock()
 			entry := state.Files[src.ID]
 			entry.ExportStatus = "complete"
 			entry.ExportRecords = result.Records
@@ -885,6 +921,7 @@ func runExportPhase(paths workLayout, cfg config, state *pipelineState, targetIn
 			entry.MinTimeNS = result.MinTimeNS
 			entry.MaxTimeNS = result.MaxTimeNS
 			if err := saveState(paths.MetaRoot, state); err != nil {
+				mu.Unlock()
 				return err
 			}
 			completed++
@@ -898,6 +935,8 @@ func runExportPhase(paths workLayout, cfg config, state *pipelineState, targetIn
 				humanProgress(result.BytesRead, src.SizeBytes),
 				humanDuration(time.Duration(result.ElapsedSeconds*float64(time.Second))),
 			)
+			mu.Unlock()
+			releaseHeap()
 			return nil
 		})
 	}
@@ -922,22 +961,77 @@ func exportSource(paths workLayout, cfg config, src sourceRef, targetInstIDs map
 		Every:       cfg.ProgressInterval,
 	}
 
-	writers := map[string]*spoolWriter{}
+	type exportWriterState struct {
+		path     string
+		kind     byte
+		writer   *spoolWriter
+		lastUsed uint64
+	}
+
+	writerStates := map[string]*exportWriterState{}
+	openWriterCount := 0
+	var writerUseSeq uint64
 	fieldCounts := map[string]map[string]int64{}
 	var minTimeNS *int64
 	var maxTimeNS *int64
 
+	closeWriter := func(state *exportWriterState) error {
+		if state == nil || state.writer == nil {
+			return nil
+		}
+		err := state.writer.Close()
+		state.writer = nil
+		openWriterCount--
+		return err
+	}
+
+	evictWriter := func() error {
+		var victim *exportWriterState
+		for _, state := range writerStates {
+			if state.writer == nil {
+				continue
+			}
+			if victim == nil || state.lastUsed < victim.lastUsed {
+				victim = state
+			}
+		}
+		if victim == nil {
+			return nil
+		}
+		return closeWriter(victim)
+	}
+
+	ensureWriter := func(writerKey, path string, kind byte) (*spoolWriter, error) {
+		state := writerStates[writerKey]
+		if state == nil {
+			state = &exportWriterState{path: path, kind: kind}
+			writerStates[writerKey] = state
+		}
+		writerUseSeq++
+		state.lastUsed = writerUseSeq
+		if state.writer != nil {
+			return state.writer, nil
+		}
+		if openWriterCount >= cfg.MaxOpenSpoolWriters {
+			if err := evictWriter(); err != nil {
+				return nil, err
+			}
+		}
+		writer, err := openSpoolWriter(path, kind, cfg.IntermediateCompressionLevel, true)
+		if err != nil {
+			return nil, err
+		}
+		state.writer = writer
+		openWriterCount++
+		return writer, nil
+	}
+
 	writeValue := func(instID, field string, ts int64, payload []byte) error {
 		writerKey := instID + "\x00" + field
-		writer, ok := writers[writerKey]
-		if !ok {
-			path := rawFieldPath(rawDir, instID, field)
-			var err error
-			writer, err = newSpoolWriter(path, fieldKind(field), cfg.IntermediateCompressionLevel)
-			if err != nil {
-				return err
-			}
-			writers[writerKey] = writer
+		path := rawFieldPath(rawDir, instID, field)
+		writer, err := ensureWriter(writerKey, path, fieldKind(field))
+		if err != nil {
+			return err
 		}
 		if err := writer.WriteRecord(ts, payload); err != nil {
 			return err
@@ -963,8 +1057,8 @@ func exportSource(paths workLayout, cfg config, src sourceRef, targetInstIDs map
 	}
 
 	defer func() {
-		for _, writer := range writers {
-			_ = writer.Close()
+		for _, state := range writerStates {
+			_ = closeWriter(state)
 		}
 	}()
 
@@ -981,8 +1075,8 @@ func exportSource(paths workLayout, cfg config, src sourceRef, targetInstIDs map
 		return exportManifest{}, fmt.Errorf("unknown source kind %q", src.Kind)
 	}
 
-	for _, writer := range writers {
-		if err := writer.Close(); err != nil {
+	for _, state := range writerStates {
+		if err := closeWriter(state); err != nil {
 			return exportManifest{}, err
 		}
 	}
@@ -1330,7 +1424,6 @@ func runMergePhase(paths workLayout, cfg config, state *pipelineState, targetIns
 				return fmt.Errorf("merge %s/%s: %w", task.InstID, task.Field, err)
 			}
 			mu.Lock()
-			defer mu.Unlock()
 			state.Merge[task.InstID][task.Field] = mergeFieldState{
 				Status:      "complete",
 				RowCount:    result.RowCount,
@@ -1339,6 +1432,7 @@ func runMergePhase(paths workLayout, cfg config, state *pipelineState, targetIns
 				DestPath:    result.DestPath,
 			}
 			if err := saveState(paths.MetaRoot, state); err != nil {
+				mu.Unlock()
 				return err
 			}
 			completed++
@@ -1352,6 +1446,8 @@ func runMergePhase(paths workLayout, cfg config, state *pipelineState, targetIns
 				result.SourceCount,
 				humanDuration(result.Elapsed),
 			)
+			mu.Unlock()
+			releaseHeap()
 			return nil
 		})
 	}
@@ -1491,6 +1587,14 @@ func mergeSingleField(paths workLayout, cfg config, instID, field string, source
 	for _, src := range sources {
 		sourceFiles = append(sourceFiles, src.FileID)
 	}
+	progress := mergeProgress{
+		InstID:      instID,
+		FieldName:   field,
+		SourceCount: len(sources),
+		StartedAt:   started,
+		LastPrinted: started,
+		Every:       cfg.ProgressInterval,
+	}
 
 	for len(h) > 0 {
 		item := popMin()
@@ -1508,6 +1612,11 @@ func mergeSingleField(paths workLayout, cfg config, instID, field string, source
 			return mergeResult{}, err
 		}
 		rowCount++
+		progress.Rows = rowCount
+		progress.LogicalBytes += spoolRecordEncodedSize(chosen.Record.Payload)
+		progress.LastTimeNS = chosen.Record.TimestampNS
+		progress.HasLastTime = true
+		progress.maybePrint()
 		for _, candidate := range same {
 			nextRecord, err := readers[candidate.Index].Advance()
 			if err != nil {
@@ -1583,7 +1692,6 @@ func runBuildPhase(paths workLayout, cfg config, state *pipelineState, targetIns
 				return fmt.Errorf("build %s: %w", instID, err)
 			}
 			mu.Lock()
-			defer mu.Unlock()
 			state.Build[instID] = buildState{
 				Status:           "complete",
 				Rows:             result.Rows,
@@ -1597,6 +1705,7 @@ func runBuildPhase(paths workLayout, cfg config, state *pipelineState, targetIns
 				CompressionLevel: cfg.CompressionLevel,
 			}
 			if err := saveState(paths.MetaRoot, state); err != nil {
+				mu.Unlock()
 				return err
 			}
 			completed++
@@ -1610,6 +1719,8 @@ func runBuildPhase(paths workLayout, cfg config, state *pipelineState, targetIns
 				humanBytes(result.BytesWritten),
 				humanDuration(result.Elapsed),
 			)
+			mu.Unlock()
+			releaseHeap()
 			return nil
 		})
 	}
@@ -1628,7 +1739,7 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 
 	existing := map[string]string{}
 	for _, field := range fieldNames {
-			path := mergedFieldPath(paths, instID, field)
+		path := mergedFieldPath(paths, instID, field)
 		if fileExists(path) {
 			existing[field] = path
 		}
@@ -1671,6 +1782,12 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 		minTimeNS    *int64
 		maxTimeNS    *int64
 	)
+	progress := buildProgress{
+		InstID:      instID,
+		StartedAt:   started,
+		LastPrinted: started,
+		Every:       cfg.ProgressInterval,
+	}
 
 	flush := func() error {
 		if len(buffer) == 0 {
@@ -1686,6 +1803,8 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 		}
 		bytesWritten += info.Size()
 		partIndex++
+		progress.PartCount = partIndex
+		progress.BytesWritten = bytesWritten
 		buffer = buffer[:0]
 		return nil
 	}
@@ -1711,6 +1830,9 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 		}
 		buffer = append(buffer, row)
 		rowsWritten++
+		progress.Rows = rowsWritten
+		progress.LastTimeNS = nextTimestamp
+		progress.HasLastTime = true
 		if minTimeNS == nil || nextTimestamp < *minTimeNS {
 			minTimeNS = ptrInt64(nextTimestamp)
 		}
@@ -1722,6 +1844,7 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 				return buildResult{}, err
 			}
 		}
+		progress.maybePrint()
 	}
 	if err := flush(); err != nil {
 		return buildResult{}, err
@@ -1882,28 +2005,50 @@ func exportArtifactComplete(paths workLayout, sourceID string) (bool, error) {
 }
 
 func newSpoolWriter(path string, kind byte, compressionLevel int) (*spoolWriter, error) {
+	return openSpoolWriter(path, kind, compressionLevel, false)
+}
+
+func openSpoolWriter(path string, kind byte, compressionLevel int, appendMode bool) (*spoolWriter, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	file, err := os.Create(path)
+	writeHeader := true
+	flags := os.O_WRONLY | os.O_CREATE
+	if appendMode {
+		flags |= os.O_APPEND
+		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+			writeHeader = false
+		}
+	} else {
+		flags |= os.O_TRUNC
+	}
+	file, err := os.OpenFile(path, flags, 0o644)
 	if err != nil {
 		return nil, err
 	}
 	level := zstd.EncoderLevelFromZstd(compressionLevel)
-	zw, err := zstd.NewWriter(file, zstd.WithEncoderLevel(level))
+	zw, err := zstd.NewWriter(
+		file,
+		zstd.WithEncoderLevel(level),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithLowerEncoderMem(true),
+		zstd.WithWindowSize(spoolZstdWindowSize),
+	)
 	if err != nil {
 		file.Close()
 		return nil, err
 	}
 	bw := bufio.NewWriterSize(zw, 1<<20)
 	writer := &spoolWriter{file: file, zw: zw, bw: bw, kind: kind}
-	if _, err := bw.WriteString(spoolMagic); err != nil {
-		writer.Close()
-		return nil, err
-	}
-	if err := bw.WriteByte(kind); err != nil {
-		writer.Close()
-		return nil, err
+	if writeHeader {
+		if _, err := bw.WriteString(spoolMagic); err != nil {
+			writer.Close()
+			return nil, err
+		}
+		if err := bw.WriteByte(kind); err != nil {
+			writer.Close()
+			return nil, err
+		}
 	}
 	return writer, nil
 }
@@ -1946,7 +2091,13 @@ func newSpoolReader(path string) (*spoolReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	zr, err := zstd.NewReader(file)
+	zr, err := zstd.NewReader(
+		file,
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderLowmem(true),
+		zstd.WithDecoderMaxWindow(spoolZstdDecoderMaxWindow),
+		zstd.WithDecoderMaxMemory(spoolZstdDecoderMaxMemory),
+	)
 	if err != nil {
 		file.Close()
 		return nil, err
@@ -2068,6 +2219,11 @@ func (r *collapsedSpoolReader) Close() error {
 		return nil
 	}
 	return r.reader.Close()
+}
+
+func releaseHeap() {
+	runtime.GC()
+	debug.FreeOSMemory()
 }
 
 func encodeValue(field string, value tsm1.Value) ([]byte, error) {
@@ -2239,8 +2395,8 @@ func mergeSourceLess(a, b sourceFieldFragment) bool {
 	return a.FileID < b.FileID
 }
 
-func statePath(metaRoot string) string     { return filepath.Join(metaRoot, stateFileName) }
-func scanIndexPath(metaRoot string) string { return filepath.Join(metaRoot, scanIndexFileName) }
+func statePath(metaRoot string) string      { return filepath.Join(metaRoot, stateFileName) }
+func scanIndexPath(metaRoot string) string  { return filepath.Join(metaRoot, scanIndexFileName) }
 func measurementRoot(baseDir string) string { return filepath.Join(baseDir, measurement) }
 func rawManifestPath(paths workLayout, sourceID string) string {
 	return filepath.Join(paths.RawRoot, sourceID, "_manifest.json")
@@ -2367,6 +2523,42 @@ func humanProgress(current, total int64) string {
 	return fmt.Sprintf("%s/%s", humanBytes(current), humanBytes(total))
 }
 
+func humanBytesRate(value int64, elapsed time.Duration) string {
+	if elapsed <= 0 {
+		return "0 B/s"
+	}
+	perSecond := int64(float64(value) / elapsed.Seconds())
+	return humanBytes(perSecond) + "/s"
+}
+
+func humanRowsRate(rows int64, elapsed time.Duration) string {
+	if elapsed <= 0 {
+		return "0/s"
+	}
+	rate := float64(rows) / elapsed.Seconds()
+	switch {
+	case rate >= 1_000_000:
+		return fmt.Sprintf("%.2fM/s", rate/1_000_000)
+	case rate >= 1_000:
+		return fmt.Sprintf("%.1fk/s", rate/1_000)
+	default:
+		return fmt.Sprintf("%.0f/s", rate)
+	}
+}
+
+func spoolRecordEncodedSize(payload []byte) int64 {
+	return int64(8 + uvarintLen(uint64(len(payload))) + len(payload))
+}
+
+func uvarintLen(value uint64) int {
+	length := 1
+	for value >= 0x80 {
+		value >>= 7
+		length++
+	}
+	return length
+}
+
 func humanDuration(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%ds", int(d.Seconds()))
@@ -2476,6 +2668,53 @@ func (p *exportProgress) maybePrintForce() {
 		emptyDash(p.LastInstID),
 		lastTime,
 		humanDuration(time.Since(p.StartedAt)),
+	)
+}
+
+func (p *mergeProgress) maybePrint() {
+	if time.Since(p.LastPrinted) < p.Every {
+		return
+	}
+	p.LastPrinted = time.Now()
+	elapsed := time.Since(p.StartedAt)
+	lastTime := "-"
+	if p.HasLastTime {
+		lastTime = time.Unix(0, p.LastTimeNS).UTC().Format(time.RFC3339Nano)
+	}
+	fmt.Printf(
+		"[merge-progress] instId=%s field=%s rows=%d rows_rate=%s out=%s rate=%s sources=%d last_time=%s elapsed=%s\n",
+		p.InstID,
+		p.FieldName,
+		p.Rows,
+		humanRowsRate(p.Rows, elapsed),
+		humanBytes(p.LogicalBytes),
+		humanBytesRate(p.LogicalBytes, elapsed),
+		p.SourceCount,
+		lastTime,
+		humanDuration(elapsed),
+	)
+}
+
+func (p *buildProgress) maybePrint() {
+	if time.Since(p.LastPrinted) < p.Every {
+		return
+	}
+	p.LastPrinted = time.Now()
+	elapsed := time.Since(p.StartedAt)
+	lastTime := "-"
+	if p.HasLastTime {
+		lastTime = time.Unix(0, p.LastTimeNS).UTC().Format(time.RFC3339Nano)
+	}
+	fmt.Printf(
+		"[build-progress] instId=%s rows=%d rows_rate=%s parts=%d size=%s rate=%s last_time=%s elapsed=%s\n",
+		p.InstID,
+		p.Rows,
+		humanRowsRate(p.Rows, elapsed),
+		p.PartCount,
+		humanBytes(p.BytesWritten),
+		humanBytesRate(p.BytesWritten, elapsed),
+		lastTime,
+		humanDuration(elapsed),
 	)
 }
 
