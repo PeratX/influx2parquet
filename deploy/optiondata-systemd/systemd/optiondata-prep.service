@@ -1,0 +1,11 @@
+[Unit]
+Description=Prepare mountpoints and overlay directories for recovered OptionData
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/optiondata-prep-paths.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

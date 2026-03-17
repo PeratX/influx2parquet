@@ -1,0 +1,19 @@
+[Unit]
+Description=bindfs recovered OptionData WAL tree
+Requires=mnt-xfs_ro.mount optiondata-prep.service
+After=mnt-xfs_ro.mount optiondata-prep.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+LimitNOFILE=1048576
+ExecStart=/usr/bin/bindfs -f --force-user=influxdb --force-group=influxdb -o ro /mnt/xfs_ro/influxdb/wal/OptionData /mnt/mapped/wal_target
+ExecStartPost=/usr/local/libexec/optiondata-wait-for-mount.sh /mnt/mapped/wal_target
+ExecStop=/usr/bin/fusermount3 -u /mnt/mapped/wal_target
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

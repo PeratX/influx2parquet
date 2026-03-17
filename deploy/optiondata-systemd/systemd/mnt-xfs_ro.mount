@@ -1,0 +1,13 @@
+[Unit]
+Description=Recovered OptionData XFS mount
+Requires=optiondata-iscsi-login.service optiondata-prep.service
+After=optiondata-iscsi-login.service optiondata-prep.service
+
+[Mount]
+What=/dev/disk/by-path/ip-192.168.136.1:3260-iscsi-iqn.2008-06.com.sysdevlabs:c0a888010cbc:vdev0-lun-1
+Where=/mnt/xfs_ro
+Type=xfs
+Options=ro,norecovery
+
+[Install]
+WantedBy=multi-user.target

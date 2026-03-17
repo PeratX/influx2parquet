@@ -1,0 +1,55 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Test, type-check, and lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Coverage and build artifacts
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+site/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local environment files
+.env
+.env.*
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Generated export artifacts
+*.parquet
+*.parquet/
+*.tsv
+*.tsv.zst
+*.blob.zst
+*.spool.zst
+
+# Resumable pipeline state/output when generated inside the repo
+**/_raw/
+**/_merged/
+**/_build/
+**/_pipeline_state.json
+**/_tsm_index.json
+

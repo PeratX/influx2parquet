@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync recovered InfluxDB meta.db into /opt/my_influx/meta
+Requires=mnt-xfs_ro.mount optiondata-prep.service
+After=mnt-xfs_ro.mount optiondata-prep.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/install -D -o influxdb -g influxdb -m 0640 /mnt/xfs_ro/influxdb/meta/meta.db /opt/my_influx/meta/meta.db
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Login recovered OptionData iSCSI target
+Wants=network-online.target iscsid.service optiondata-prep.service
+After=network-online.target iscsid.service optiondata-prep.service
+Requires=iscsid.service optiondata-prep.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/optiondata-iscsi-login.sh
+ExecStop=/usr/local/libexec/optiondata-iscsi-logout.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

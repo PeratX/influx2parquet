@@ -1,0 +1,13 @@
+[Unit]
+Description=Overlay mount for recovered OptionData WAL
+Requires=bindfs-optiondata-wal.service optiondata-prep.service
+After=bindfs-optiondata-wal.service optiondata-prep.service
+
+[Mount]
+What=overlay
+Where=/opt/my_influx/wal/OptionData
+Type=overlay
+Options=lowerdir=/mnt/mapped/wal_target,upperdir=/opt/upper/wal,workdir=/opt/work/wal
+
+[Install]
+WantedBy=multi-user.target
