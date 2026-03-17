@@ -90,7 +90,7 @@ Reset complete.
 To resume the TSM scan/export pipeline, rerun your previous command, for example:
 
   sudo -u influxdb /home/niko/influx2parquet/.venv/bin/python \
-    /home/niko/influx2parquet/export_okex_depth_tsm.py \
+    /home/niko/influx2parquet/python/export_okex_depth_tsm.py \
     --output-dir /mnt/backup_hdd/exported_parallel \
     --workers 6 \
     --stop-after scan

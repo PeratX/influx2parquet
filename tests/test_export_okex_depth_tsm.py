@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import io
+import sys
 from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 import export_okex_depth_tsm as exporter
 

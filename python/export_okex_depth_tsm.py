@@ -25,7 +25,7 @@ completed phase/task unless --overwrite is used.
 
 Run this script as a user that can read the InfluxDB TSM tree, typically:
 
-    sudo -u influxdb /home/niko/influx2parquet/.venv/bin/python export_okex_depth_tsm.py ...
+    sudo -u influxdb /home/niko/influx2parquet/.venv/bin/python /home/niko/influx2parquet/python/export_okex_depth_tsm.py ...
 """
 
 from __future__ import annotations

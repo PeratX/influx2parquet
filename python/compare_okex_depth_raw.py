@@ -15,7 +15,7 @@ try:
 except ModuleNotFoundError as exc:  # pragma: no cover
     raise SystemExit(
         "missing dependency: zstandard\n"
-        "run this script with /home/niko/influx2parquet/.venv/bin/python"
+        "run this script with /home/niko/influx2parquet/.venv/bin/python /home/niko/influx2parquet/python/compare_okex_depth_raw.py"
     ) from exc
 
 
