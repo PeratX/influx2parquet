@@ -45,11 +45,15 @@ Thumbs.db
 *.tsv.zst
 *.blob.zst
 *.spool.zst
+*.bin.zst
 
 # Resumable pipeline state/output when generated inside the repo
 **/_raw/
 **/_merged/
 **/_build/
+**/_raw_go/
+**/_merged_go/
+**/_build_go/
 **/_pipeline_state.json
+**/_pipeline_state_go.json
 **/_tsm_index.json
-
