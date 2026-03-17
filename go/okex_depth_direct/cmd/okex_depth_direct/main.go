@@ -95,6 +95,7 @@ type config struct {
 	IntermediateCompressionLevel int
 	Workers                      int
 	BuildWorkers                 int
+	MergeFanIn                   int
 	MaxOpenSpoolWriters          int
 	ProgressInterval             time.Duration
 	Overwrite                    bool
@@ -375,15 +376,6 @@ func run() error {
 		return err
 	}
 
-	dataTree, err := resolveInfluxTree(cfg.DataDir, cfg.Database, cfg.Retention)
-	if err != nil {
-		return err
-	}
-	walTree, err := resolveInfluxTree(cfg.WALDir, cfg.Database, cfg.Retention)
-	if err != nil {
-		return err
-	}
-
 	index, err := loadScanIndex(paths.MetaRoot)
 	if err != nil {
 		return err
@@ -396,20 +388,45 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	tsmSources, err := tsmSourcesFromScan(index, dataTree, targetInstIDs)
-	if err != nil {
-		return err
-	}
-	walSources, err := walSourcesForMatchedShards(walTree, tsmSources)
-	if err != nil {
-		return err
-	}
-	sources := append(tsmSources, walSources...)
-	sort.Slice(sources, func(i, j int) bool { return sourceLess(sources[i], sources[j]) })
 
-	state, err := ensureState(paths, cfg, dataTree, walTree, targetInstIDs, sources)
-	if err != nil {
-		return err
+	var (
+		dataTree   influxTree
+		walTree    influxTree
+		tsmSources []sourceRef
+		walSources []sourceRef
+		sources    []sourceRef
+		state      *pipelineState
+	)
+	if phaseNeedsSourceRoots(cfg.StopAfter) {
+		dataTree, err = resolveInfluxTree(cfg.DataDir, cfg.Database, cfg.Retention)
+		if err != nil {
+			return err
+		}
+		walTree, err = resolveInfluxTree(cfg.WALDir, cfg.Database, cfg.Retention)
+		if err != nil {
+			return err
+		}
+		tsmSources, err = tsmSourcesFromScan(index, dataTree, targetInstIDs)
+		if err != nil {
+			return err
+		}
+		walSources, err = walSourcesForMatchedShards(walTree, tsmSources)
+		if err != nil {
+			return err
+		}
+		sources = append(tsmSources, walSources...)
+		sort.Slice(sources, func(i, j int) bool { return sourceLess(sources[i], sources[j]) })
+
+		state, err = ensureState(paths, cfg, dataTree, walTree, targetInstIDs, sources)
+		if err != nil {
+			return err
+		}
+	} else {
+		state, err = prepareExistingStateForOfflinePhase(paths, cfg)
+		if err != nil {
+			return err
+		}
+		tsmSources, walSources = sourceCountsFromState(state, targetInstIDs)
 	}
 
 	fmt.Printf(
@@ -441,21 +458,33 @@ func run() error {
 		return nil
 	}
 
-	fmt.Printf(
-		"[target] inst_ids=%s matched_files=%d wal_sources=%d data_layout=%s wal_layout=%s\n",
-		strings.Join(targetInstIDs, ","),
-		len(tsmSources),
-		len(walSources),
-		dataTree.Layout,
-		walTree.Layout,
-	)
-
-	if err := runExportPhase(paths, cfg, state, targetInstIDs, sources); err != nil {
-		return err
+	if phaseNeedsSourceRoots(cfg.StopAfter) {
+		fmt.Printf(
+			"[target] inst_ids=%s matched_files=%d wal_sources=%d data_layout=%s wal_layout=%s\n",
+			strings.Join(targetInstIDs, ","),
+			len(tsmSources),
+			len(walSources),
+			dataTree.Layout,
+			walTree.Layout,
+		)
+	} else {
+		fmt.Printf(
+			"[target] inst_ids=%s matched_files=%d wal_sources=%d offline_phase=%s\n",
+			strings.Join(targetInstIDs, ","),
+			len(tsmSources),
+			len(walSources),
+			phaseName(cfg.StopAfter),
+		)
 	}
-	if cfg.StopAfter == "export" {
-		fmt.Println("[stop] after export")
-		return nil
+
+	if phaseNeedsSourceRoots(cfg.StopAfter) {
+		if err := runExportPhase(paths, cfg, state, targetInstIDs, sources); err != nil {
+			return err
+		}
+		if cfg.StopAfter == "export" {
+			fmt.Println("[stop] after export")
+			return nil
+		}
 	}
 
 	if err := runMergePhase(paths, cfg, state, targetInstIDs); err != nil {
@@ -482,8 +511,8 @@ func parseConfig() (config, error) {
 	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 	fs.StringVar(&cfg.Database, "database", defaultDatabase, "InfluxDB database name")
 	fs.StringVar(&cfg.Retention, "retention", defaultRetention, "InfluxDB retention policy")
-	fs.StringVar(&cfg.DataDir, "data-dir", "/opt/my_influx/data", "InfluxDB data root or database root")
-	fs.StringVar(&cfg.WALDir, "wal-dir", "/opt/my_influx/wal", "InfluxDB wal root or database root")
+	fs.StringVar(&cfg.DataDir, "data-dir", "/opt/my_influx/data", "InfluxDB data root or database root; only used for scan/export")
+	fs.StringVar(&cfg.WALDir, "wal-dir", "/opt/my_influx/wal", "InfluxDB wal root or database root; only used for scan/export")
 	fs.StringVar(&cfg.OutputDir, "output-dir", "direct_exports", "Metadata root and default final output root")
 	fs.StringVar(&cfg.RawDir, "raw-dir", "", "Optional base directory for export intermediates; defaults under --output-dir")
 	fs.StringVar(&cfg.MergedDir, "merged-dir", "", "Optional base directory for merged intermediates; defaults under --output-dir")
@@ -498,6 +527,7 @@ func parseConfig() (config, error) {
 	fs.IntVar(&cfg.IntermediateCompressionLevel, "intermediate-compression-level", 3, "Intermediate zstd compression level")
 	fs.IntVar(&cfg.Workers, "workers", 1, "Parallel workers for export and merge")
 	fs.IntVar(&cfg.BuildWorkers, "build-workers", 2, "Parallel workers for build")
+	fs.IntVar(&cfg.MergeFanIn, "merge-fan-in", 32, "Maximum source readers opened by one merge task")
 	fs.IntVar(&cfg.MaxOpenSpoolWriters, "max-open-spool-writers", 4, "Maximum concurrently-open zstd spool writers per source export")
 	progressSeconds := fs.Int("progress-interval", 5, "Progress print interval in seconds")
 	fs.BoolVar(&cfg.Overwrite, "overwrite", false, "Reset Go export/merge/build state but keep existing scan result")
@@ -509,6 +539,7 @@ func parseConfig() (config, error) {
 	cfg.InstIDs = dedupSortedStrings(instIDs)
 	cfg.Workers = max(1, cfg.Workers)
 	cfg.BuildWorkers = max(1, cfg.BuildWorkers)
+	cfg.MergeFanIn = max(2, cfg.MergeFanIn)
 	cfg.MaxOpenSpoolWriters = max(1, cfg.MaxOpenSpoolWriters)
 	cfg.ProgressInterval = time.Duration(max(1, *progressSeconds)) * time.Second
 	cfg.StartNS, err = parseRFC3339Nano(cfg.Start)
@@ -536,6 +567,24 @@ func parseRFC3339Nano(text string) (int64, error) {
 		return 0, err
 	}
 	return t.UTC().UnixNano(), nil
+}
+
+func phaseNeedsSourceRoots(stopAfter string) bool {
+	switch stopAfter {
+	case "", "scan", "export":
+		return true
+	case "merge", "build":
+		return false
+	default:
+		return true
+	}
+}
+
+func phaseName(stopAfter string) string {
+	if stopAfter == "" {
+		return "full"
+	}
+	return stopAfter
 }
 
 func resolveWorkLayout(cfg config) (workLayout, error) {
@@ -848,7 +897,30 @@ func ensureState(paths workLayout, cfg config, dataTree, walTree influxTree, tar
 		return nil, err
 	}
 	if !equalMeta(state.Meta, meta) {
-		return nil, fmt.Errorf("existing Go pipeline state does not match current request; rerun with --overwrite to rebuild export/merge/build state")
+		if !equalMetaIgnoringWorkspaceRoots(state.Meta, meta) {
+			return nil, fmt.Errorf("existing Go pipeline state does not match current request; rerun with --overwrite to rebuild export/merge/build state")
+		}
+		oldMeta := state.Meta
+		state.Meta.RawRoot = meta.RawRoot
+		state.Meta.MergedRoot = meta.MergedRoot
+		state.Meta.BuildRoot = meta.BuildRoot
+		state.Meta.FinalRoot = meta.FinalRoot
+		state.Meta.ScanIndexPath = meta.ScanIndexPath
+		state.UpdatedAt = utcNowISO()
+		fmt.Printf(
+			"[workspace-relocated] raw=%s -> %s merged=%s -> %s build=%s -> %s final=%s -> %s\n",
+			oldMeta.RawRoot,
+			state.Meta.RawRoot,
+			oldMeta.MergedRoot,
+			state.Meta.MergedRoot,
+			oldMeta.BuildRoot,
+			state.Meta.BuildRoot,
+			oldMeta.FinalRoot,
+			state.Meta.FinalRoot,
+		)
+		if err := saveState(paths.MetaRoot, state); err != nil {
+			return nil, err
+		}
 	}
 	if len(state.Files) != len(sources) {
 		return nil, fmt.Errorf("existing Go pipeline state source count changed; rerun with --overwrite")
@@ -863,6 +935,79 @@ func ensureState(paths workLayout, cfg config, dataTree, walTree influxTree, tar
 		}
 	}
 	return state, nil
+}
+
+func prepareExistingStateForOfflinePhase(paths workLayout, cfg config) (*pipelineState, error) {
+	state, err := loadState(paths.MetaRoot)
+	if err != nil {
+		return nil, err
+	}
+	if state.Meta.PipelineName != "okex_depth_direct_go" {
+		return nil, fmt.Errorf("existing pipeline state is not a Go okex_depth pipeline: %s", state.Meta.PipelineName)
+	}
+	if state.Meta.Measurement != measurement {
+		return nil, fmt.Errorf("pipeline state measurement mismatch: %s", state.Meta.Measurement)
+	}
+	if state.Meta.Database != cfg.Database {
+		return nil, fmt.Errorf("existing pipeline state database mismatch: state=%s request=%s", state.Meta.Database, cfg.Database)
+	}
+	if state.Meta.Retention != cfg.Retention {
+		return nil, fmt.Errorf("existing pipeline state retention mismatch: state=%s request=%s", state.Meta.Retention, cfg.Retention)
+	}
+	if state.Meta.StartNS != cfg.StartNS || state.Meta.EndNS != cfg.EndNS {
+		return nil, fmt.Errorf("existing pipeline state time window mismatch; rerun with the original --start/--end or use a matching state directory")
+	}
+	oldMeta := state.Meta
+	state.Meta.RawRoot = paths.RawRoot
+	state.Meta.MergedRoot = paths.MergedRoot
+	state.Meta.BuildRoot = paths.BuildRoot
+	state.Meta.FinalRoot = paths.FinalRoot
+	state.Meta.ScanIndexPath = scanIndexPath(paths.MetaRoot)
+	if oldMeta.RawRoot != state.Meta.RawRoot ||
+		oldMeta.MergedRoot != state.Meta.MergedRoot ||
+		oldMeta.BuildRoot != state.Meta.BuildRoot ||
+		oldMeta.FinalRoot != state.Meta.FinalRoot ||
+		oldMeta.ScanIndexPath != state.Meta.ScanIndexPath {
+		fmt.Printf(
+			"[workspace-relocated] raw=%s -> %s merged=%s -> %s build=%s -> %s final=%s -> %s\n",
+			oldMeta.RawRoot,
+			state.Meta.RawRoot,
+			oldMeta.MergedRoot,
+			state.Meta.MergedRoot,
+			oldMeta.BuildRoot,
+			state.Meta.BuildRoot,
+			oldMeta.FinalRoot,
+			state.Meta.FinalRoot,
+		)
+		if err := saveState(paths.MetaRoot, state); err != nil {
+			return nil, err
+		}
+	}
+	return state, nil
+}
+
+func sourceCountsFromState(state *pipelineState, targetInstIDs []string) ([]sourceRef, []sourceRef) {
+	targetSet := make(map[string]struct{}, len(targetInstIDs))
+	for _, instID := range targetInstIDs {
+		targetSet[instID] = struct{}{}
+	}
+	var tsmSources []sourceRef
+	var walSources []sourceRef
+	for _, entry := range state.Files {
+		src := entry.Source
+		if src.Kind == sourceKindTSM && len(targetSet) > 0 && !intersects(src.InstIDs, targetSet) {
+			continue
+		}
+		switch src.Kind {
+		case sourceKindTSM:
+			tsmSources = append(tsmSources, src)
+		case sourceKindWAL:
+			walSources = append(walSources, src)
+		}
+	}
+	sort.Slice(tsmSources, func(i, j int) bool { return sourceLess(tsmSources[i], tsmSources[j]) })
+	sort.Slice(walSources, func(i, j int) bool { return sourceLess(walSources[i], walSources[j]) })
+	return tsmSources, walSources
 }
 
 func runExportPhase(paths workLayout, cfg config, state *pipelineState, targetInstIDs []string, sources []sourceRef) error {
@@ -1279,6 +1424,10 @@ func replayWALFile(path string, valuesByKey map[string][]walValueRecord, writeSe
 	for reader.Next() {
 		entry, err := reader.Read()
 		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				fmt.Printf("[warn] truncated wal ignored path=%s consumed=%s error=%v\n", path, humanBytes(reader.Count()), err)
+				return nil
+			}
 			return fmt.Errorf("read wal %s: %w", path, err)
 		}
 		switch item := entry.(type) {
@@ -1512,6 +1661,15 @@ func gatherMergeSources(paths workLayout, state *pipelineState, targetInstIDs []
 	return result, nil
 }
 
+type orderedSpoolInput struct {
+	Path string
+}
+
+type mergeStageFile struct {
+	Path string
+	Rows int64
+}
+
 func mergeSingleField(paths workLayout, cfg config, instID, field string, sources []sourceFieldFragment) (mergeResult, error) {
 	started := time.Now()
 	destPath := mergedFieldPath(paths, instID, field)
@@ -1530,17 +1688,140 @@ func mergeSingleField(paths workLayout, cfg config, instID, field string, source
 		}, nil
 	}
 
-	writer, err := newSpoolWriter(destPath, fieldKind(field), cfg.IntermediateCompressionLevel)
+	sourceFiles := make([]string, 0, len(sources))
+	for _, src := range sources {
+		sourceFiles = append(sourceFiles, src.FileID)
+	}
+
+	progress := mergeProgress{
+		InstID:      instID,
+		FieldName:   field,
+		SourceCount: len(sources),
+		StartedAt:   started,
+		LastPrinted: started,
+		Every:       cfg.ProgressInterval,
+	}
+
+	if len(sources) <= cfg.MergeFanIn {
+		inputs := make([]orderedSpoolInput, 0, len(sources))
+		for _, src := range sources {
+			inputs = append(inputs, orderedSpoolInput{Path: src.Path})
+		}
+		rowCount, err := mergeOrderedSpoolInputs(destPath, fieldKind(field), cfg.IntermediateCompressionLevel, inputs, &progress)
+		if err != nil {
+			return mergeResult{}, err
+		}
+		return mergeResult{
+			InstID:      instID,
+			FieldName:   field,
+			DestPath:    destPath,
+			RowCount:    rowCount,
+			SourceCount: len(sources),
+			SourceFiles: sourceFiles,
+			Elapsed:     time.Since(started),
+		}, nil
+	}
+
+	tempRoot := filepath.Join(paths.MergedRoot, ".merge_tmp")
+	if err := os.MkdirAll(tempRoot, 0o755); err != nil {
+		return mergeResult{}, err
+	}
+	tempDir, err := os.MkdirTemp(tempRoot, fmt.Sprintf("%s_%s_", safeTempName(instID), safeTempName(field)))
 	if err != nil {
 		return mergeResult{}, err
 	}
-	defer writer.Close()
+	defer os.RemoveAll(tempDir)
 
-	readers := make([]*collapsedSpoolReader, 0, len(sources))
-	for _, src := range sources {
-		reader, err := newCollapsedSpoolReader(src.Path)
+	stageFiles := make([]mergeStageFile, 0, (len(sources)+cfg.MergeFanIn-1)/cfg.MergeFanIn)
+	stageChunk := 0
+	for i := 0; i < len(sources); i += cfg.MergeFanIn {
+		j := minInt(i+cfg.MergeFanIn, len(sources))
+		inputs := make([]orderedSpoolInput, 0, j-i)
+		for _, src := range sources[i:j] {
+			inputs = append(inputs, orderedSpoolInput{Path: src.Path})
+		}
+		stagePath := filepath.Join(tempDir, fmt.Sprintf("stage0-%04d%s", stageChunk, spoolExt))
+		stageRows, err := mergeOrderedSpoolInputs(stagePath, fieldKind(field), cfg.IntermediateCompressionLevel, inputs, nil)
 		if err != nil {
 			return mergeResult{}, err
+		}
+		stageFiles = append(stageFiles, mergeStageFile{Path: stagePath, Rows: stageRows})
+		stageChunk++
+	}
+	fmt.Printf(
+		"[merge-stage] instId=%s field=%s stage=0 batches=%d fan_in=%d sources=%d elapsed=%s\n",
+		instID,
+		field,
+		len(stageFiles),
+		cfg.MergeFanIn,
+		len(sources),
+		humanDuration(time.Since(started)),
+	)
+
+	stage := 1
+	for len(stageFiles) > 1 {
+		nextStage := make([]mergeStageFile, 0, (len(stageFiles)+cfg.MergeFanIn-1)/cfg.MergeFanIn)
+		stageChunk = 0
+		for i := 0; i < len(stageFiles); i += cfg.MergeFanIn {
+			j := minInt(i+cfg.MergeFanIn, len(stageFiles))
+			inputs := make([]orderedSpoolInput, 0, j-i)
+			progressPtr := (*mergeProgress)(nil)
+			if len(stageFiles) <= cfg.MergeFanIn {
+				progressPtr = &progress
+			}
+			for _, stageFile := range stageFiles[i:j] {
+				inputs = append(inputs, orderedSpoolInput{Path: stageFile.Path})
+			}
+			stagePath := filepath.Join(tempDir, fmt.Sprintf("stage%d-%04d%s", stage, stageChunk, spoolExt))
+			stageRows, err := mergeOrderedSpoolInputs(stagePath, fieldKind(field), cfg.IntermediateCompressionLevel, inputs, progressPtr)
+			if err != nil {
+				return mergeResult{}, err
+			}
+			for _, stageFile := range stageFiles[i:j] {
+				_ = os.Remove(stageFile.Path)
+			}
+			nextStage = append(nextStage, mergeStageFile{Path: stagePath, Rows: stageRows})
+			stageChunk++
+		}
+		stageFiles = nextStage
+		fmt.Printf(
+			"[merge-stage] instId=%s field=%s stage=%d batches=%d fan_in=%d elapsed=%s\n",
+			instID,
+			field,
+			stage,
+			len(stageFiles),
+			cfg.MergeFanIn,
+			humanDuration(time.Since(started)),
+		)
+		stage++
+	}
+
+	if err := os.Rename(stageFiles[0].Path, destPath); err != nil {
+		return mergeResult{}, err
+	}
+	return mergeResult{
+		InstID:      instID,
+		FieldName:   field,
+		DestPath:    destPath,
+		RowCount:    stageFiles[0].Rows,
+		SourceCount: len(sources),
+		SourceFiles: sourceFiles,
+		Elapsed:     time.Since(started),
+	}, nil
+}
+
+func mergeOrderedSpoolInputs(destPath string, kind byte, compressionLevel int, inputs []orderedSpoolInput, progress *mergeProgress) (int64, error) {
+	writer, err := newSpoolWriter(destPath, kind, compressionLevel)
+	if err != nil {
+		return 0, err
+	}
+	defer writer.Close()
+
+	readers := make([]*collapsedSpoolReader, 0, len(inputs))
+	for _, input := range inputs {
+		reader, err := newCollapsedSpoolReader(input.Path)
+		if err != nil {
+			return 0, err
 		}
 		defer reader.Close()
 		readers = append(readers, reader)
@@ -1583,19 +1864,6 @@ func mergeSingleField(paths workLayout, cfg config, instID, field string, source
 	}
 
 	var rowCount int64
-	sourceFiles := make([]string, 0, len(sources))
-	for _, src := range sources {
-		sourceFiles = append(sourceFiles, src.FileID)
-	}
-	progress := mergeProgress{
-		InstID:      instID,
-		FieldName:   field,
-		SourceCount: len(sources),
-		StartedAt:   started,
-		LastPrinted: started,
-		Every:       cfg.ProgressInterval,
-	}
-
 	for len(h) > 0 {
 		item := popMin()
 		same := []heapItem{item}
@@ -1609,18 +1877,20 @@ func mergeSingleField(paths workLayout, cfg config, instID, field string, source
 			}
 		}
 		if err := writer.WriteRecord(chosen.Record.TimestampNS, chosen.Record.Payload); err != nil {
-			return mergeResult{}, err
+			return 0, err
 		}
 		rowCount++
-		progress.Rows = rowCount
-		progress.LogicalBytes += spoolRecordEncodedSize(chosen.Record.Payload)
-		progress.LastTimeNS = chosen.Record.TimestampNS
-		progress.HasLastTime = true
-		progress.maybePrint()
+		if progress != nil {
+			progress.Rows = rowCount
+			progress.LogicalBytes += spoolRecordEncodedSize(chosen.Record.Payload)
+			progress.LastTimeNS = chosen.Record.TimestampNS
+			progress.HasLastTime = true
+			progress.maybePrint()
+		}
 		for _, candidate := range same {
 			nextRecord, err := readers[candidate.Index].Advance()
 			if err != nil {
-				return mergeResult{}, err
+				return 0, err
 			}
 			if nextRecord != nil {
 				pushItem(heapItem{
@@ -1634,17 +1904,9 @@ func mergeSingleField(paths workLayout, cfg config, instID, field string, source
 	}
 
 	if err := writer.Close(); err != nil {
-		return mergeResult{}, err
+		return 0, err
 	}
-	return mergeResult{
-		InstID:      instID,
-		FieldName:   field,
-		DestPath:    destPath,
-		RowCount:    rowCount,
-		SourceCount: len(sources),
-		SourceFiles: sourceFiles,
-		Elapsed:     time.Since(started),
-	}, nil
+	return rowCount, nil
 }
 
 func runBuildPhase(paths workLayout, cfg config, state *pipelineState, targetInstIDs []string) error {
@@ -2330,6 +2592,29 @@ func equalMeta(a, b pipelineMeta) bool {
 		sameStrings(a.InstIDs, b.InstIDs)
 }
 
+func equalMetaIgnoringWorkspaceRoots(a, b pipelineMeta) bool {
+	return a.PipelineVersion == b.PipelineVersion &&
+		a.PipelineName == b.PipelineName &&
+		a.Measurement == b.Measurement &&
+		a.Database == b.Database &&
+		a.Retention == b.Retention &&
+		a.DataDir == b.DataDir &&
+		a.WALDir == b.WALDir &&
+		a.DataLayout == b.DataLayout &&
+		a.WALLayout == b.WALLayout &&
+		a.DatabaseRoot == b.DatabaseRoot &&
+		a.RetentionRoot == b.RetentionRoot &&
+		a.WALRetentionRoot == b.WALRetentionRoot &&
+		a.Start == b.Start &&
+		a.End == b.End &&
+		a.StartNS == b.StartNS &&
+		a.EndNS == b.EndNS &&
+		a.IntermediateFormat == b.IntermediateFormat &&
+		a.IntermediateCompression == b.IntermediateCompression &&
+		a.MetaRoot == b.MetaRoot &&
+		sameStrings(a.InstIDs, b.InstIDs)
+}
+
 func equalMergedSignature(a, b map[string]mergedFieldSignature) bool {
 	if len(a) != len(b) {
 		return false
@@ -2570,6 +2855,22 @@ func humanDuration(d time.Duration) string {
 		return fmt.Sprintf("%dh%02dm%02ds", hours, minutes, seconds)
 	}
 	return fmt.Sprintf("%dm%02ds", minutes, seconds)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+var tempNameSanitizer = strings.NewReplacer("/", "_", "\\", "_", ":", "_", " ", "_")
+
+func safeTempName(value string) string {
+	if value == "" {
+		return "empty"
+	}
+	return tempNameSanitizer.Replace(value)
 }
 
 func formatNS(value *int64) any {

@@ -57,3 +57,6 @@ Thumbs.db
 **/_pipeline_state.json
 **/_pipeline_state_go.json
 **/_tsm_index.json
+
+# Local rebuilt exporter binary placed at repo root
+/okex_depth_direct
