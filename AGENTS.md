@@ -68,7 +68,7 @@ Exclude because they are option-related or test data:
 - If space is tight, dropping `binance_depth20` after keeping `binance_depth` is the safer compromise. Dropping `okex_depth` loses unique order book data.
 
 ## Current `okex_depth` Pipeline
-- Use [export_okex_depth_tsm.py](/home/niko/influx2parquet/python/export_okex_depth_tsm.py) for `okex_depth`. It is the preferred direct-TSM pipeline and avoids the InfluxDB HTTP/JSON query path.
+- Use [export_okex_depth_tsm.py](python/export_okex_depth_tsm.py) for `okex_depth`. It is the preferred direct-TSM pipeline and avoids the InfluxDB HTTP/JSON query path.
 - The pipeline has 4 resumable phases: `scan`, `export`, `merge`, `build`.
 - Pipeline state lives under `<output-dir>/okex_depth/`:
   - `_pipeline_state.json`
@@ -80,7 +80,7 @@ Exclude because they are option-related or test data:
 - `scan`, `export`, `merge`, and `build` all have progress output and resumable state.
 
 ## Influx Tree Layouts
-- [export_okex_depth_tsm.py](/home/niko/influx2parquet/python/export_okex_depth_tsm.py) supports both directory layouts:
+- [export_okex_depth_tsm.py](python/export_okex_depth_tsm.py) supports both directory layouts:
   - `data-root`: `<data-dir>/<database>/<retention>`
   - `database-root`: `<database-root>/<retention>`
 - Typical paths in this recovery environment:
@@ -92,12 +92,12 @@ Exclude because they are option-related or test data:
 
 ## Recovery Stack Caveats
 - The direct TSM pipeline does **not** require `influxdb` to be running.
-- Legacy exporters such as [extract_optiondata_to_parquet.py](/home/niko/influx2parquet/python/extract_optiondata_to_parquet.py) and [export_parallel_instid.py](/home/niko/influx2parquet/python/export_parallel_instid.py) still depend on `influxdb`.
+- Legacy exporters such as [extract_optiondata_to_parquet.py](python/extract_optiondata_to_parquet.py) and [export_parallel_instid.py](python/export_parallel_instid.py) still depend on `influxdb`.
 - If `influxdb` is left running on the overlay-backed recovered database, it may generate large `.tsm` and `.tsm.tmp` files under `/opt/upper/data`, which fills the VM root filesystem.
 - For this reason, direct `okex_depth` scan/export should prefer bindfs paths and can safely run with `influxdb` stopped.
 
 ## Reset and Meta Sync
-- Use [reset_optiondata_stack.sh](/home/niko/influx2parquet/scripts/reset_optiondata_stack.sh) to tear down and rebuild the recovered OptionData mount stack.
+- Use [reset_optiondata_stack.sh](scripts/reset_optiondata_stack.sh) to tear down and rebuild the recovered OptionData mount stack.
 - The reset script now force-unmounts overlay/bindfs paths, clears `/opt/upper/*` and `/opt/work/*`, rebuilds the recovery stack, and intentionally leaves `influxdb` stopped.
 - After deleting `/opt/my_influx/meta/meta.db`, `optiondata-meta-sync.service` must be **restarted**, not merely started, because it is a `oneshot` unit with `RemainAfterExit=yes`.
 

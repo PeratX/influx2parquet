@@ -2,6 +2,10 @@
 
 把 InfluxDB `OptionData` 里的选定市场数据导出成紧凑、可恢复、易分析的 Parquet 数据集。
 
+项目过程记录见：
+
+- [blog.md](blog.md)
+
 这个仓库现在同时包含三类东西：
 
 - 通用的 Python 导出脚本，用于大部分 keep-list measurement。
@@ -35,26 +39,26 @@
 
 按今天这个仓库的实际状态，推荐这样理解：
 
-- 大多数 measurement：优先用 [python/extract_optiondata_to_parquet.py](/home/niko/influx2parquet/python/extract_optiondata_to_parquet.py)。
-- 需要按 `instId` 并发拆任务的深度流：用 [python/export_parallel_instid.py](/home/niko/influx2parquet/python/export_parallel_instid.py)。
-- `okex_depth`：优先用 Go 版 direct TSM/WAL 导出器 [go/okex_depth_direct/cmd/okex_depth_direct/main.go](/home/niko/influx2parquet/go/okex_depth_direct/cmd/okex_depth_direct/main.go)。
-- Python 版 [python/export_okex_depth_tsm.py](/home/niko/influx2parquet/python/export_okex_depth_tsm.py) 仍然保留，适合参考旧流水线、兼容旧中间产物，或在 Go 版不可用时兜底。
+- 大多数 measurement：优先用 [python/extract_optiondata_to_parquet.py](python/extract_optiondata_to_parquet.py)。
+- 需要按 `instId` 并发拆任务的深度流：用 [python/export_parallel_instid.py](python/export_parallel_instid.py)。
+- `okex_depth`：优先用 Go 版 direct TSM/WAL 导出器 [go/okex_depth_direct/cmd/okex_depth_direct/main.go](go/okex_depth_direct/cmd/okex_depth_direct/main.go)。
+- Python 版 [python/export_okex_depth_tsm.py](python/export_okex_depth_tsm.py) 仍然保留，适合参考旧流水线、兼容旧中间产物，或在 Go 版不可用时兜底。
 
 ## 仓库结构
 
-- [python](/home/niko/influx2parquet/python)
+- [python](python)
   Python 脚本主目录。
-- [go/okex_depth_direct](/home/niko/influx2parquet/go/okex_depth_direct)
+- [go/okex_depth_direct](go/okex_depth_direct)
   `okex_depth` 的高吞吐 direct TSM/WAL Go 导出器。
-- [scripts](/home/niko/influx2parquet/scripts)
+- [scripts](scripts)
   恢复环境的挂载/重置脚本。
-- [application_notes](/home/niko/influx2parquet/application_notes)
+- [application_notes](application_notes)
   面向 LLM/人工阅读的目录说明和输出目录摘要工具。
-- [tests](/home/niko/influx2parquet/tests)
+- [tests](tests)
   Python 侧回归测试。
-- [AGENTS.md](/home/niko/influx2parquet/AGENTS.md)
+- [AGENTS.md](AGENTS.md)
   项目约束、keep-list、恢复环境说明。
-- [MEMORY.md](/home/niko/influx2parquet/MEMORY.md)
+- [MEMORY.md](MEMORY.md)
   当前协作上下文备忘。
 
 ## 导出流程总览
@@ -69,7 +73,7 @@
 
 对应脚本：
 
-- [python/extract_optiondata_to_parquet.py](/home/niko/influx2parquet/python/extract_optiondata_to_parquet.py)
+- [python/extract_optiondata_to_parquet.py](python/extract_optiondata_to_parquet.py)
 
 ### `okex_depth`
 
@@ -101,50 +105,50 @@ Go 版流水线分 4 个阶段：
 
 ### Python
 
-- [python/extract_optiondata_to_parquet.py](/home/niko/influx2parquet/python/extract_optiondata_to_parquet.py)
+- [python/extract_optiondata_to_parquet.py](python/extract_optiondata_to_parquet.py)
   通用单 measurement 导出器。适合默认 keep-list 里的大多数 measurement。依赖 InfluxDB HTTP 接口。
 
-- [python/export_parallel_instid.py](/home/niko/influx2parquet/python/export_parallel_instid.py)
+- [python/export_parallel_instid.py](python/export_parallel_instid.py)
   把 `okex_depth` 或 `binance_depth20` 按 `instId` 拆成多个 worker 并发跑。仍然基于 Python HTTP 导出器，不是 direct TSM。
 
-- [python/export_okex_depth_tsm.py](/home/niko/influx2parquet/python/export_okex_depth_tsm.py)
+- [python/export_okex_depth_tsm.py](python/export_okex_depth_tsm.py)
   旧版 direct-TSM `okex_depth` 流水线。支持 `scan/export/merge/build` 四阶段，原始和合并中间层是 `.tsv.zst`。
 
-- [python/compare_okex_depth_raw.py](/home/niko/influx2parquet/python/compare_okex_depth_raw.py)
+- [python/compare_okex_depth_raw.py](python/compare_okex_depth_raw.py)
   对比旧 Python `_raw.bak` 和新 Go `_raw_go` 中间产物。可做 manifest 级比较，也可做逐条记录比对。
 
-- [python/check_okex_depth_merge_before_raw_cleanup.py](/home/niko/influx2parquet/python/check_okex_depth_merge_before_raw_cleanup.py)
+- [python/check_okex_depth_merge_before_raw_cleanup.py](python/check_okex_depth_merge_before_raw_cleanup.py)
   在 `merge` 完成后检查 `_merged_go` 是否足够可靠，帮助判断 `_raw_go` 是否可以手动删除。只检查，不删除。
 
-- [python/compare_parquet_sizes.py](/home/niko/influx2parquet/python/compare_parquet_sizes.py)
+- [python/compare_parquet_sizes.py](python/compare_parquet_sizes.py)
   统计导出后 Parquet 的真实落盘体积、Parquet 元数据中的压缩前大小、节省空间和压缩比。
 
-- [python/recalculate_dataset_checkpoint.py](/home/niko/influx2parquet/python/recalculate_dataset_checkpoint.py)
+- [python/recalculate_dataset_checkpoint.py](python/recalculate_dataset_checkpoint.py)
   某个 dataset 的 part 文件丢失后，重建 `_checkpoint.json` 和相关元数据。
 
 ### Go
 
-- [go/okex_depth_direct/cmd/okex_depth_direct/main.go](/home/niko/influx2parquet/go/okex_depth_direct/cmd/okex_depth_direct/main.go)
+- [go/okex_depth_direct/cmd/okex_depth_direct/main.go](go/okex_depth_direct/cmd/okex_depth_direct/main.go)
   当前最快的 `okex_depth` direct TSM/WAL 导出器。绕过 `influx_inspect export` 的 line protocol 文本路径，直接读取 TSM/WAL，写二进制 spool，再构建 Parquet。
 
-- [go/okex_depth_direct/internal/influxlite/tsm1](/home/niko/influx2parquet/go/okex_depth_direct/internal/influxlite/tsm1)
+- [go/okex_depth_direct/internal/influxlite/tsm1](go/okex_depth_direct/internal/influxlite/tsm1)
   从官方 InfluxDB 读取逻辑裁下来的轻量 TSM/WAL 读取层，用来避免把整套 Influx/Flux 依赖链编进来。
 
 ### Shell / 文档
 
-- [scripts/reset_optiondata_stack.sh](/home/niko/influx2parquet/scripts/reset_optiondata_stack.sh)
+- [scripts/reset_optiondata_stack.sh](scripts/reset_optiondata_stack.sh)
   重新搭建恢复环境的 overlay/bindfs 栈，并清掉污染的 upper/work 目录。默认保留 `influxdb` 停止状态。
 
-- [application_notes/README.md](/home/niko/influx2parquet/application_notes/README.md)
+- [application_notes/README.md](application_notes/README.md)
   输出目录说明入口。
 
-- [application_notes/exported.md](/home/niko/influx2parquet/application_notes/exported.md)
+- [application_notes/exported.md](application_notes/exported.md)
   `/mnt/backup_hdd/exported` 的用途说明。
 
-- [application_notes/exported_parallel.md](/home/niko/influx2parquet/application_notes/exported_parallel.md)
+- [application_notes/exported_parallel.md](application_notes/exported_parallel.md)
   `/mnt/backup_hdd/exported_parallel` 的用途说明，尤其是 `okex_depth` 流水线目录结构。
 
-- [application_notes/build_export_catalog.py](/home/niko/influx2parquet/application_notes/build_export_catalog.py)
+- [application_notes/build_export_catalog.py](application_notes/build_export_catalog.py)
   为 LLM 或人工生成输出目录摘要 JSON。
 
 ## 输出目录
@@ -245,7 +249,7 @@ sudo -u influxdb /tmp/okex_depth_direct \
 
 Go 版 `okex_depth` 导出器使用独立模块：
 
-- [go/okex_depth_direct/go.mod](/home/niko/influx2parquet/go/okex_depth_direct/go.mod)
+- [go/okex_depth_direct/go.mod](go/okex_depth_direct/go.mod)
 
 常见构建命令：
 
@@ -268,14 +272,14 @@ go build ./cmd/okex_depth_direct
 
 第一次接手时，建议先看：
 
-1. [AGENTS.md](/home/niko/influx2parquet/AGENTS.md)
-2. [README.md](/home/niko/influx2parquet/README.md)
-3. [python/extract_optiondata_to_parquet.py](/home/niko/influx2parquet/python/extract_optiondata_to_parquet.py)
-4. [go/okex_depth_direct/cmd/okex_depth_direct/main.go](/home/niko/influx2parquet/go/okex_depth_direct/cmd/okex_depth_direct/main.go)
-5. [application_notes/exported_parallel.md](/home/niko/influx2parquet/application_notes/exported_parallel.md)
+1. [AGENTS.md](AGENTS.md)
+2. [README.md](README.md)
+3. [python/extract_optiondata_to_parquet.py](python/extract_optiondata_to_parquet.py)
+4. [go/okex_depth_direct/cmd/okex_depth_direct/main.go](go/okex_depth_direct/cmd/okex_depth_direct/main.go)
+5. [application_notes/exported_parallel.md](application_notes/exported_parallel.md)
 
 如果你只关心 `okex_depth`：
 
-1. [go/okex_depth_direct/cmd/okex_depth_direct/main.go](/home/niko/influx2parquet/go/okex_depth_direct/cmd/okex_depth_direct/main.go)
-2. [python/check_okex_depth_merge_before_raw_cleanup.py](/home/niko/influx2parquet/python/check_okex_depth_merge_before_raw_cleanup.py)
-3. [python/compare_okex_depth_raw.py](/home/niko/influx2parquet/python/compare_okex_depth_raw.py)
+1. [go/okex_depth_direct/cmd/okex_depth_direct/main.go](go/okex_depth_direct/cmd/okex_depth_direct/main.go)
+2. [python/check_okex_depth_merge_before_raw_cleanup.py](python/check_okex_depth_merge_before_raw_cleanup.py)
+3. [python/compare_okex_depth_raw.py](python/compare_okex_depth_raw.py)
