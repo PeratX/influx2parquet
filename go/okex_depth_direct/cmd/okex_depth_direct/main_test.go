@@ -429,6 +429,31 @@ func TestPackCompactBookPayloadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCompactBookPayloadSerde(t *testing.T) {
+	packed, err := packCompactBookPayload(
+		[]byte("[[\"1.23\",\"4.5\",\"0\",\"7\"]]"),
+		compactBookScales{PxScale: 4, SzScale: 3},
+	)
+	if err != nil {
+		t.Fatalf("packCompactBookPayload() error = %v", err)
+	}
+
+	book, err := unpackCompactBookPayload(packed)
+	if err != nil {
+		t.Fatalf("unpackCompactBookPayload() error = %v", err)
+	}
+
+	want := &compactBookSide{
+		Px:     []int64{12300},
+		Sz:     []int64{4500},
+		Liq:    []int64{0},
+		Orders: []int64{7},
+	}
+	if !reflect.DeepEqual(book, want) {
+		t.Fatalf("serde result = %+v, want %+v", book, want)
+	}
+}
+
 func TestUnpackCompactBookPayloadRejectsMalformed(t *testing.T) {
 	tests := []struct {
 		name    string
