@@ -323,6 +323,9 @@ type exportProgress struct {
 type mergeProgress struct {
 	InstID       string
 	FieldName    string
+	Stage        int
+	BatchIndex   int
+	BatchTotal   int
 	Rows         int64
 	LogicalBytes int64
 	SourceCount  int
@@ -1540,12 +1543,19 @@ func runMergePhase(paths workLayout, cfg config, state *pipelineState, targetIns
 					continue
 				}
 			}
+			if existing.Status == "running" {
+				existing.Status = "pending"
+				state.Merge[instID][field] = existing
+			}
 			tasks = append(tasks, struct {
 				InstID string
 				Field  string
 				Src    []sourceFieldFragment
 			}{InstID: instID, Field: field, Src: sourceList})
 		}
+	}
+	if err := saveState(paths.MetaRoot, state); err != nil {
+		return err
 	}
 	if len(tasks) == 0 {
 		fmt.Println("[merge] already-complete")
@@ -1557,17 +1567,17 @@ func runMergePhase(paths workLayout, cfg config, state *pipelineState, targetIns
 	g.SetLimit(cfg.Workers)
 	for _, task := range tasks {
 		task := task
-		mu.Lock()
-		fieldState := state.Merge[task.InstID][task.Field]
-		fieldState.Status = "running"
-		state.Merge[task.InstID][task.Field] = fieldState
-		if err := saveState(paths.MetaRoot, state); err != nil {
-			mu.Unlock()
-			return err
-		}
-		mu.Unlock()
-
 		g.Go(func() error {
+			mu.Lock()
+			fieldState := state.Merge[task.InstID][task.Field]
+			fieldState.Status = "running"
+			state.Merge[task.InstID][task.Field] = fieldState
+			if err := saveState(paths.MetaRoot, state); err != nil {
+				mu.Unlock()
+				return err
+			}
+			mu.Unlock()
+
 			result, err := mergeSingleField(paths, cfg, task.InstID, task.Field, task.Src)
 			if err != nil {
 				return fmt.Errorf("merge %s/%s: %w", task.InstID, task.Field, err)
@@ -1673,6 +1683,9 @@ type mergeStageFile struct {
 func mergeSingleField(paths workLayout, cfg config, instID, field string, sources []sourceFieldFragment) (mergeResult, error) {
 	started := time.Now()
 	destPath := mergedFieldPath(paths, instID, field)
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return mergeResult{}, err
+	}
 	if err := os.RemoveAll(destPath); err != nil {
 		return mergeResult{}, err
 	}
@@ -1733,6 +1746,7 @@ func mergeSingleField(paths workLayout, cfg config, instID, field string, source
 	defer os.RemoveAll(tempDir)
 
 	stageFiles := make([]mergeStageFile, 0, (len(sources)+cfg.MergeFanIn-1)/cfg.MergeFanIn)
+	stage0BatchTotal := (len(sources) + cfg.MergeFanIn - 1) / cfg.MergeFanIn
 	stageChunk := 0
 	for i := 0; i < len(sources); i += cfg.MergeFanIn {
 		j := minInt(i+cfg.MergeFanIn, len(sources))
@@ -1741,10 +1755,51 @@ func mergeSingleField(paths workLayout, cfg config, instID, field string, source
 			inputs = append(inputs, orderedSpoolInput{Path: src.Path})
 		}
 		stagePath := filepath.Join(tempDir, fmt.Sprintf("stage0-%04d%s", stageChunk, spoolExt))
-		stageRows, err := mergeOrderedSpoolInputs(stagePath, fieldKind(field), cfg.IntermediateCompressionLevel, inputs, nil)
+		batchStarted := time.Now()
+		fmt.Printf(
+			"[merge-batch] instId=%s field=%s stage=0 batch=%d/%d inputs=%d src_range=%d:%d dest=%s started=%s\n",
+			instID,
+			field,
+			stageChunk+1,
+			stage0BatchTotal,
+			len(inputs),
+			i,
+			j,
+			stagePath,
+			batchStarted.UTC().Format(time.RFC3339),
+		)
+		batchProgress := mergeProgress{
+			InstID:      instID,
+			FieldName:   field,
+			Stage:       0,
+			BatchIndex:  stageChunk + 1,
+			BatchTotal:  stage0BatchTotal,
+			SourceCount: len(inputs),
+			StartedAt:   batchStarted,
+			LastPrinted: batchStarted,
+			Every:       cfg.ProgressInterval,
+		}
+		stageRows, err := mergeOrderedSpoolInputs(stagePath, fieldKind(field), cfg.IntermediateCompressionLevel, inputs, &batchProgress)
 		if err != nil {
 			return mergeResult{}, err
 		}
+		stageInfo, statErr := os.Stat(stagePath)
+		stageSize := int64(0)
+		if statErr == nil {
+			stageSize = stageInfo.Size()
+		}
+		fmt.Printf(
+			"[merge-batch] instId=%s field=%s stage=0 batch=%d/%d rows=%d rows_rate=%s out=%s rate=%s elapsed=%s\n",
+			instID,
+			field,
+			stageChunk+1,
+			stage0BatchTotal,
+			stageRows,
+			humanRowsRate(stageRows, time.Since(batchStarted)),
+			humanBytes(stageSize),
+			humanBytesRate(stageSize, time.Since(batchStarted)),
+			humanDuration(time.Since(batchStarted)),
+		)
 		stageFiles = append(stageFiles, mergeStageFile{Path: stagePath, Rows: stageRows})
 		stageChunk++
 	}
@@ -1765,18 +1820,58 @@ func mergeSingleField(paths workLayout, cfg config, instID, field string, source
 		for i := 0; i < len(stageFiles); i += cfg.MergeFanIn {
 			j := minInt(i+cfg.MergeFanIn, len(stageFiles))
 			inputs := make([]orderedSpoolInput, 0, j-i)
+			batchStarted := time.Now()
+			stageBatchTotal := (len(stageFiles) + cfg.MergeFanIn - 1) / cfg.MergeFanIn
 			progressPtr := (*mergeProgress)(nil)
 			if len(stageFiles) <= cfg.MergeFanIn {
+				progress.Rows = 0
+				progress.LogicalBytes = 0
+				progress.HasLastTime = false
+				progress.Stage = stage
+				progress.BatchIndex = stageChunk + 1
+				progress.BatchTotal = stageBatchTotal
+				progress.SourceCount = len(inputs)
+				progress.StartedAt = batchStarted
+				progress.LastPrinted = batchStarted
 				progressPtr = &progress
 			}
 			for _, stageFile := range stageFiles[i:j] {
 				inputs = append(inputs, orderedSpoolInput{Path: stageFile.Path})
 			}
 			stagePath := filepath.Join(tempDir, fmt.Sprintf("stage%d-%04d%s", stage, stageChunk, spoolExt))
+			fmt.Printf(
+				"[merge-batch] instId=%s field=%s stage=%d batch=%d/%d inputs=%d dest=%s started=%s\n",
+				instID,
+				field,
+				stage,
+				stageChunk+1,
+				stageBatchTotal,
+				len(inputs),
+				stagePath,
+				batchStarted.UTC().Format(time.RFC3339),
+			)
 			stageRows, err := mergeOrderedSpoolInputs(stagePath, fieldKind(field), cfg.IntermediateCompressionLevel, inputs, progressPtr)
 			if err != nil {
 				return mergeResult{}, err
 			}
+			stageInfo, statErr := os.Stat(stagePath)
+			stageSize := int64(0)
+			if statErr == nil {
+				stageSize = stageInfo.Size()
+			}
+			fmt.Printf(
+				"[merge-batch] instId=%s field=%s stage=%d batch=%d/%d rows=%d rows_rate=%s out=%s rate=%s elapsed=%s\n",
+				instID,
+				field,
+				stage,
+				stageChunk+1,
+				stageBatchTotal,
+				stageRows,
+				humanRowsRate(stageRows, time.Since(batchStarted)),
+				humanBytes(stageSize),
+				humanBytesRate(stageSize, time.Since(batchStarted)),
+				humanDuration(time.Since(batchStarted)),
+			)
 			for _, stageFile := range stageFiles[i:j] {
 				_ = os.Remove(stageFile.Path)
 			}
@@ -2981,6 +3076,24 @@ func (p *mergeProgress) maybePrint() {
 	lastTime := "-"
 	if p.HasLastTime {
 		lastTime = time.Unix(0, p.LastTimeNS).UTC().Format(time.RFC3339Nano)
+	}
+	if p.BatchTotal > 0 {
+		fmt.Printf(
+			"[merge-progress] instId=%s field=%s stage=%d batch=%d/%d rows=%d rows_rate=%s out=%s rate=%s sources=%d last_time=%s elapsed=%s\n",
+			p.InstID,
+			p.FieldName,
+			p.Stage,
+			p.BatchIndex,
+			p.BatchTotal,
+			p.Rows,
+			humanRowsRate(p.Rows, elapsed),
+			humanBytes(p.LogicalBytes),
+			humanBytesRate(p.LogicalBytes, elapsed),
+			p.SourceCount,
+			lastTime,
+			humanDuration(elapsed),
+		)
+		return
 	}
 	fmt.Printf(
 		"[merge-progress] instId=%s field=%s rows=%d rows_rate=%s out=%s rate=%s sources=%d last_time=%s elapsed=%s\n",

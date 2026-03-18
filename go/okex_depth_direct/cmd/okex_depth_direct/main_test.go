@@ -1,8 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestHumanBytes(t *testing.T) {
@@ -88,5 +92,98 @@ func TestResolveWorkLayoutSplitRoots(t *testing.T) {
 	}
 	if got, want := layout.FinalRoot, filepath.Join("/mnt/finaldisk", measurement); got != want {
 		t.Fatalf("FinalRoot = %q, want %q", got, want)
+	}
+}
+
+func TestMergeSingleFieldStagedCreatesDestDirAndRenames(t *testing.T) {
+	tempDir := t.TempDir()
+	paths := workLayout{
+		MetaRoot:   filepath.Join(tempDir, "meta"),
+		RawRoot:    filepath.Join(tempDir, "raw"),
+		MergedRoot: filepath.Join(tempDir, "merged"),
+		BuildRoot:  filepath.Join(tempDir, "build"),
+		FinalRoot:  filepath.Join(tempDir, "final"),
+	}
+	for _, path := range []string{paths.MetaRoot, paths.RawRoot, paths.MergedRoot, paths.BuildRoot, paths.FinalRoot} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+	}
+
+	cfg := config{
+		IntermediateCompressionLevel: 3,
+		MergeFanIn:                   40,
+		ProgressInterval:             24 * time.Hour,
+	}
+
+	const instID = "BTC-USDT-SWAP"
+	const field = "action"
+	sources := make([]sourceFieldFragment, 0, 41)
+	for i := 0; i < 41; i++ {
+		sourceID := fmt.Sprintf("src-%03d", i)
+		baseDir := filepath.Join(paths.RawRoot, sourceID)
+		if err := os.MkdirAll(filepath.Join(baseDir, instID), 0o755); err != nil {
+			t.Fatalf("mkdir raw dir: %v", err)
+		}
+		rawPath := rawFieldPath(baseDir, instID, field)
+		writer, err := newSpoolWriter(rawPath, fieldKind(field), cfg.IntermediateCompressionLevel)
+		if err != nil {
+			t.Fatalf("newSpoolWriter(%s): %v", rawPath, err)
+		}
+		payload := []byte(fmt.Sprintf("value-%03d", i))
+		if err := writer.WriteRecord(int64(1000+i), payload); err != nil {
+			t.Fatalf("WriteRecord(%s): %v", rawPath, err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("Close(%s): %v", rawPath, err)
+		}
+		sources = append(sources, sourceFieldFragment{
+			FileID:     sourceID,
+			Path:       rawPath,
+			Kind:       sourceKindTSM,
+			ShardID:    i,
+			Generation: 1,
+			Sequence:   1,
+		})
+	}
+
+	result, err := mergeSingleField(paths, cfg, instID, field, sources)
+	if err != nil {
+		t.Fatalf("mergeSingleField() error = %v", err)
+	}
+	if got, want := result.RowCount, int64(len(sources)); got != want {
+		t.Fatalf("RowCount = %d, want %d", got, want)
+	}
+
+	destPath := mergedFieldPath(paths, instID, field)
+	if _, err := os.Stat(destPath); err != nil {
+		t.Fatalf("merged output missing at %s: %v", destPath, err)
+	}
+	if _, err := os.Stat(filepath.Join(paths.MergedRoot, ".merge_tmp")); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("stat .merge_tmp: %v", err)
+	}
+
+	reader, err := newSpoolReader(destPath)
+	if err != nil {
+		t.Fatalf("newSpoolReader(%s): %v", destPath, err)
+	}
+	defer reader.Close()
+
+	count := 0
+	for {
+		record, err := reader.ReadRecord()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("ReadRecord(): %v", err)
+		}
+		if got, want := string(record.Payload), fmt.Sprintf("value-%03d", count); got != want {
+			t.Fatalf("payload[%d] = %q, want %q", count, got, want)
+		}
+		count++
+	}
+	if count != len(sources) {
+		t.Fatalf("record count = %d, want %d", count, len(sources))
 	}
 }
