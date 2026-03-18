@@ -53,6 +53,9 @@ const (
 	spoolZstdWindowSize       = 1 << 20
 	spoolZstdDecoderMaxWindow = 128 << 20
 	spoolZstdDecoderMaxMemory = 256 << 20
+	buildMaxRowsPerRowGroup   = 65536
+	parquetPageBufferSize     = 1 << 20
+	parquetWriteBufferSize    = 1 << 20
 )
 
 var (
@@ -350,7 +353,6 @@ type buildProgress struct {
 
 type parquetRow struct {
 	Time     int64   `parquet:"time,timestamp(nanosecond:utc)"`
-	InstID   string  `parquet:"instId"`
 	Action   *string `parquet:"action,optional"`
 	Asks     *string `parquet:"asks,optional"`
 	Bids     *string `parquet:"bids,optional"`
@@ -490,12 +492,18 @@ func run() error {
 		}
 	}
 
-	if err := runMergePhase(paths, cfg, state, targetInstIDs); err != nil {
-		return err
-	}
-	if cfg.StopAfter == "merge" {
-		fmt.Println("[stop] after merge")
-		return nil
+	if cfg.StopAfter == "build" && !phaseNeedsSourceRoots(cfg.StopAfter) {
+		if err := ensureMergeComplete(paths, state, targetInstIDs); err != nil {
+			return err
+		}
+	} else {
+		if err := runMergePhase(paths, cfg, state, targetInstIDs); err != nil {
+			return err
+		}
+		if cfg.StopAfter == "merge" {
+			fmt.Println("[stop] after merge")
+			return nil
+		}
 	}
 
 	if err := runBuildPhase(paths, cfg, state, targetInstIDs); err != nil {
@@ -1613,6 +1621,32 @@ func runMergePhase(paths workLayout, cfg config, state *pipelineState, targetIns
 	return g.Wait()
 }
 
+func ensureMergeComplete(paths workLayout, state *pipelineState, targetInstIDs []string) error {
+	for _, instID := range targetInstIDs {
+		fields := state.Merge[instID]
+		if fields == nil {
+			return fmt.Errorf("merge state missing for %s", instID)
+		}
+		for _, field := range fieldNames {
+			entry, ok := fields[field]
+			if !ok {
+				return fmt.Errorf("merge state missing for %s/%s", instID, field)
+			}
+			if entry.Status != "complete" {
+				return fmt.Errorf("merge incomplete for %s/%s: status=%s", instID, field, entry.Status)
+			}
+			destPath := entry.DestPath
+			if destPath == "" {
+				destPath = mergedFieldPath(paths, instID, field)
+			}
+			if entry.SourceCount > 0 && !fileExists(destPath) {
+				return fmt.Errorf("merged file missing for %s/%s: %s", instID, field, destPath)
+			}
+		}
+	}
+	return nil
+}
+
 func gatherMergeSources(paths workLayout, state *pipelineState, targetInstIDs []string) (map[string]map[string][]sourceFieldFragment, error) {
 	targetSet := make(map[string]struct{}, len(targetInstIDs))
 	for _, instID := range targetInstIDs {
@@ -2169,8 +2203,7 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 	for hasCurrent(current) {
 		nextTimestamp := nextTimestamp(current)
 		row := parquetRow{
-			Time:   nextTimestamp,
-			InstID: instID,
+			Time: nextTimestamp,
 		}
 		for field, record := range current {
 			if record == nil || record.TimestampNS != nextTimestamp {
@@ -2259,14 +2292,20 @@ func writeParquetPart(path string, rows []parquetRow, compression string, compre
 }
 
 func parquetWriterOptions(codecName string, level int) ([]parquet.WriterOption, error) {
+	baseOptions := []parquet.WriterOption{
+		parquet.MaxRowsPerRowGroup(buildMaxRowsPerRowGroup),
+		parquet.PageBufferSize(parquetPageBufferSize),
+		parquet.WriteBufferSize(parquetWriteBufferSize),
+		parquet.DataPageStatistics(false),
+	}
 	switch strings.ToLower(codecName) {
 	case "", "zstd":
 		codec := &parquetzstd.Codec{Level: parquetzstd.Level(zstd.EncoderLevelFromZstd(level))}
-		return []parquet.WriterOption{parquet.Compression(codec)}, nil
+		return append(baseOptions, parquet.Compression(codec)), nil
 	case "snappy":
-		return []parquet.WriterOption{parquet.Compression(&parquet.Snappy)}, nil
+		return append(baseOptions, parquet.Compression(&parquet.Snappy)), nil
 	case "none", "uncompressed":
-		return nil, nil
+		return baseOptions, nil
 	default:
 		return nil, fmt.Errorf("unsupported parquet compression codec: %s", codecName)
 	}

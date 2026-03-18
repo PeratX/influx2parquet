@@ -1,6 +1,6 @@
 # influx2parquet
 
-把 InfluxDB `OptionData` 里的选定市场数据导出成紧凑、可恢复、易分析的 Parquet 数据集。
+把 InfluxDB `OptionData` 里的市场数据尽可能完整地保留下来，并在合适的地方导出成紧凑、可恢复、易分析的 Parquet 数据集。
 
 项目过程记录见：
 
@@ -14,7 +14,13 @@
 
 ## 目标
 
-默认需要保留的 measurement：
+当前目标分两层：
+
+- 第一优先级仍然是离线完成 `okex_depth` 的 direct TSM/WAL `scan -> export -> merge -> build`。
+- 在 `okex_depth` 完成前，尽量保持 `influxdb` 离线，避免恢复环境继续生成 overlay 污染。
+- `okex_depth` 完成后，重新上线 `influxdb`，继续保全更完整的市场数据历史。
+
+原始第一优先级 measurement：
 
 - `binance_depth`
 - `binance_ticker`
@@ -25,7 +31,7 @@
 - `candlestick`
 - `perpetual`
 
-可选的深度簿 measurement：
+高价值的深度簿 measurement：
 
 - `binance_depth20`
 - `okex_depth`
@@ -35,6 +41,12 @@
 - `binance_depth20` 是更深的 Binance 原始盘口流。
 - `okex_depth` 是唯一的 OKX 原始盘口深度数据，不能被 `okex_ticker` / `okex_trades` 替代。
 
+新的业务上下文下，保全范围已经扩大：
+
+- 不再只局限于现货 / 永续 / ticker / trade。
+- option、binary option、prediction-market 相关历史数据现在也属于保全目标。
+- 因此，以前仅因“option 相关”而被默认排除的 measurement，需要重新评估，而不是直接丢弃。
+
 ## 当前推荐路径
 
 按今天这个仓库的实际状态，推荐这样理解：
@@ -43,6 +55,12 @@
 - 需要按 `instId` 并发拆任务的深度流：用 [python/export_parallel_instid.py](python/export_parallel_instid.py)。
 - `okex_depth`：优先用 Go 版 direct TSM/WAL 导出器 [go/okex_depth_direct/cmd/okex_depth_direct/main.go](go/okex_depth_direct/cmd/okex_depth_direct/main.go)。
 - Python 版 [python/export_okex_depth_tsm.py](python/export_okex_depth_tsm.py) 仍然保留，适合参考旧流水线、兼容旧中间产物，或在 Go 版不可用时兜底。
+
+当前顺序不是“所有 measurement 一起并行推进”，而是：
+
+1. 先完成 `okex_depth`
+2. 再让 `influxdb` 回到在线状态
+3. 再继续处理更广泛的 option / binary option / prediction-market 数据
 
 ## 仓库结构
 
@@ -75,6 +93,8 @@
 
 - [python/extract_optiondata_to_parquet.py](python/extract_optiondata_to_parquet.py)
 
+这个通用 HTTP 导出器仍然适合后续更广泛的 measurement 保全工作，包括重新纳入的 option 类市场数据。
+
 ### `okex_depth`
 
 `okex_depth` 的数据量和 payload 形态都更特殊，因此单独走 direct TSM/WAL 流水线。
@@ -101,6 +121,53 @@ Go 版流水线分 4 个阶段：
 - `<instId>.parquet/`
   最终数据集。
 
+在当前项目阶段，`okex_depth` 仍然是整个仓库的第一优先级任务。
+
+### `okex_depth` Final Parquet Schema
+
+最终 `<instId>.parquet/` 里的核心列现在是：
+
+- `time`
+  Parquet `timestamp(nanosecond:utc)`，对应记录时间。
+- `action`
+  `string`，原始值如 `snapshot` / `update`。
+- `asks`
+  `string`，直接保留原始盘口 JSON 文本，例如 `[[\"65000.1\",\"12.5\",\"0\",\"1\"], ...]`。
+- `bids`
+  `string`，直接保留原始盘口 JSON 文本。
+- `checksum`
+  `int64`
+- `ts`
+  `string`，保留原始字符串时间戳。
+
+当前格式回到直接 JSON 文本存储：
+
+- `instId` 不再按行重复写入；每个 dataset 目录本身就对应一个 `instId`
+- 不依赖 parquet metadata 里的额外 scale 信息
+- 不再使用 packed binary 或结构化盘口编码
+- `asks` / `bids` 可以直接被 DuckDB、PyArrow、Polars 或自定义脚本按 JSON 文本解析
+- 文件体积会更大，但写入路径更简单，也更接近最初的高吞吐版本
+
+如果你需要在 Python 里读取并把结构化盘口重建回可读数组，可以直接参考：
+
+- [python/read_okex_depth_compact_parquet.py](python/read_okex_depth_compact_parquet.py)
+
+这个读取脚本只面向当前这版 schema：
+
+- `instId` 不在每行列里；默认从 dataset 目录名理解
+- `asks` / `bids` 是原始 JSON 文本
+- `--decode-book` 会把盘口文本解析成数组
+
+示例：
+
+```bash
+/home/niko/influx2parquet/.venv/bin/python \
+  /home/niko/influx2parquet/python/read_okex_depth_compact_parquet.py \
+  /mnt/intelssd/okex_depth/BTC-USDT-SWAP.parquet \
+  --limit 3 \
+  --decode-book
+```
+
 ## 主要脚本说明
 
 ### Python
@@ -119,6 +186,9 @@ Go 版流水线分 4 个阶段：
 
 - [python/check_okex_depth_merge_before_raw_cleanup.py](python/check_okex_depth_merge_before_raw_cleanup.py)
   在 `merge` 完成后检查 `_merged_go` 是否足够可靠，帮助判断 `_raw_go` 是否可以手动删除。只检查，不删除。
+
+- [python/read_okex_depth_compact_parquet.py](python/read_okex_depth_compact_parquet.py)
+  读取当前 `okex_depth` Parquet 格式，并可把 `asks` / `bids` 的原始 JSON 文本解析成数组。
 
 - [python/compare_parquet_sizes.py](python/compare_parquet_sizes.py)
   统计导出后 Parquet 的真实落盘体积、Parquet 元数据中的压缩前大小、节省空间和压缩比。

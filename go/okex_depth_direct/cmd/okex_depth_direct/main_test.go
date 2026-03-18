@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -185,5 +186,55 @@ func TestMergeSingleFieldStagedCreatesDestDirAndRenames(t *testing.T) {
 	}
 	if count != len(sources) {
 		t.Fatalf("record count = %d, want %d", count, len(sources))
+	}
+}
+
+func TestAssignRowFieldJSONSchema(t *testing.T) {
+	row := parquetRow{}
+
+	if err := assignRowField(&row, "action", []byte("snapshot")); err != nil {
+		t.Fatalf("assign action: %v", err)
+	}
+	if row.Action == nil || *row.Action != "snapshot" {
+		t.Fatalf("action = %v, want snapshot", row.Action)
+	}
+
+	asks := []byte("[[\"1.25\",\"2.5\",\"0\",\"7\"],[\"1.20\",\"2\",\"1\",\"8\"]]")
+	if err := assignRowField(&row, "asks", asks); err != nil {
+		t.Fatalf("assign asks: %v", err)
+	}
+	if row.Asks == nil || *row.Asks != string(asks) {
+		t.Fatalf("asks = %v, want %q", row.Asks, asks)
+	}
+
+	bids := []byte("[[\"1.10\",\"3\",\"0\",\"2\"]]")
+	if err := assignRowField(&row, "bids", bids); err != nil {
+		t.Fatalf("assign bids: %v", err)
+	}
+	if row.Bids == nil || *row.Bids != string(bids) {
+		t.Fatalf("bids = %v, want %q", row.Bids, bids)
+	}
+
+	if err := assignRowField(&row, "ts", []byte("1700000000000")); err != nil {
+		t.Fatalf("assign ts: %v", err)
+	}
+	if row.TS == nil || *row.TS != "1700000000000" {
+		t.Fatalf("ts = %v, want 1700000000000", row.TS)
+	}
+
+	var checksum [8]byte
+	binary.LittleEndian.PutUint64(checksum[:], uint64(123456789))
+	if err := assignRowField(&row, "checksum", checksum[:]); err != nil {
+		t.Fatalf("assign checksum: %v", err)
+	}
+	if row.Checksum == nil || *row.Checksum != 123456789 {
+		t.Fatalf("checksum = %v, want 123456789", row.Checksum)
+	}
+}
+
+func TestAssignRowFieldRejectsBadChecksumPayload(t *testing.T) {
+	row := parquetRow{}
+	if err := assignRowField(&row, "checksum", []byte{1, 2, 3}); err == nil {
+		t.Fatalf("assignRowField(checksum) error = nil, want non-nil")
 	}
 }
