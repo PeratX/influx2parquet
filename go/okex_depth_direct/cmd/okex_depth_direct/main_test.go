@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -189,42 +191,51 @@ func TestMergeSingleFieldStagedCreatesDestDirAndRenames(t *testing.T) {
 	}
 }
 
-func TestAssignRowFieldJSONSchema(t *testing.T) {
+func TestAssignRowFieldCompactEncodings(t *testing.T) {
 	row := parquetRow{}
+	scales := compactBookScales{PxScale: 4, SzScale: 3}
 
-	if err := assignRowField(&row, "action", []byte("snapshot")); err != nil {
+	if err := assignRowField(&row, "action", []byte("snapshot"), scales); err != nil {
 		t.Fatalf("assign action: %v", err)
 	}
-	if row.Action == nil || *row.Action != "snapshot" {
-		t.Fatalf("action = %v, want snapshot", row.Action)
+	if row.Action == nil || *row.Action != 1 {
+		t.Fatalf("action = %v, want 1", row.Action)
 	}
 
 	asks := []byte("[[\"1.25\",\"2.5\",\"0\",\"7\"],[\"1.20\",\"2\",\"1\",\"8\"]]")
-	if err := assignRowField(&row, "asks", asks); err != nil {
+	if err := assignRowField(&row, "asks", asks, scales); err != nil {
 		t.Fatalf("assign asks: %v", err)
 	}
-	if row.Asks == nil || *row.Asks != string(asks) {
-		t.Fatalf("asks = %v, want %q", row.Asks, asks)
+	if row.AsksRaw != nil {
+		t.Fatalf("asks raw fallback unexpectedly set: %q", row.AsksRaw)
+	}
+	book, err := unpackCompactBookPayload(row.Asks)
+	if err != nil {
+		t.Fatalf("unpack asks: %v", err)
+	}
+	if got, want := book.Px, []int64{12500, 12000}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("asks px = %v, want %v", got, want)
+	}
+	if got, want := book.Sz, []int64{2500, 2000}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("asks sz = %v, want %v", got, want)
+	}
+	if got, want := book.Liq, []int64{0, 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("asks liq = %v, want %v", got, want)
+	}
+	if got, want := book.Orders, []int64{7, 8}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("asks orders = %v, want %v", got, want)
 	}
 
-	bids := []byte("[[\"1.10\",\"3\",\"0\",\"2\"]]")
-	if err := assignRowField(&row, "bids", bids); err != nil {
-		t.Fatalf("assign bids: %v", err)
-	}
-	if row.Bids == nil || *row.Bids != string(bids) {
-		t.Fatalf("bids = %v, want %q", row.Bids, bids)
-	}
-
-	if err := assignRowField(&row, "ts", []byte("1700000000000")); err != nil {
+	if err := assignRowField(&row, "ts", []byte("1700000000000"), scales); err != nil {
 		t.Fatalf("assign ts: %v", err)
 	}
-	if row.TS == nil || *row.TS != "1700000000000" {
+	if row.TS == nil || *row.TS != 1700000000000 {
 		t.Fatalf("ts = %v, want 1700000000000", row.TS)
 	}
 
 	var checksum [8]byte
 	binary.LittleEndian.PutUint64(checksum[:], uint64(123456789))
-	if err := assignRowField(&row, "checksum", checksum[:]); err != nil {
+	if err := assignRowField(&row, "checksum", checksum[:], scales); err != nil {
 		t.Fatalf("assign checksum: %v", err)
 	}
 	if row.Checksum == nil || *row.Checksum != 123456789 {
@@ -232,9 +243,274 @@ func TestAssignRowFieldJSONSchema(t *testing.T) {
 	}
 }
 
-func TestAssignRowFieldRejectsBadChecksumPayload(t *testing.T) {
+func TestDetectCompactBookScalesUsesSampleRowsAndSpareDigits(t *testing.T) {
+	rows := []pendingBuildRow{
+		{
+			TimeNS:      1,
+			AsksPayload: []byte("[[\"65000.1\",\"12.5\",\"0\",\"1\"]]"),
+			HasAsks:     true,
+		},
+		{
+			TimeNS:      2,
+			BidsPayload: []byte("[[\"0.12345\",\"0.0001000\",\"0\",\"3\"],[\"0.1\",\"2.5000\",\"1\",\"4\"]]"),
+			HasBids:     true,
+		},
+	}
+
+	if got, want := detectCompactBookScales(rows), (compactBookScales{PxScale: 7, SzScale: 6}); got != want {
+		t.Fatalf("detectCompactBookScales() = %+v, want %+v", got, want)
+	}
+}
+
+func TestCompactBookMetadataIncludesDetectedScale(t *testing.T) {
+	metadata := compactBookMetadata("BTC-USDT-SWAP", compactBookScales{PxScale: 7, SzScale: 6})
+	if got, want := metadata["okex_depth.asks_px_scale"], "7"; got != want {
+		t.Fatalf("asks px scale metadata = %q, want %q", got, want)
+	}
+	if got, want := metadata["okex_depth.bids_sz_scale"], "6"; got != want {
+		t.Fatalf("bids sz scale metadata = %q, want %q", got, want)
+	}
+	if got, want := metadata["okex_depth.scale_sample_rows"], "10"; got != want {
+		t.Fatalf("scale sample rows metadata = %q, want %q", got, want)
+	}
+	if got, want := metadata["okex_depth.scale_spare_digits"], "2"; got != want {
+		t.Fatalf("scale spare digits metadata = %q, want %q", got, want)
+	}
+	if got, want := metadata["okex_depth.book_encoding"], "packed_i64le_v1"; got != want {
+		t.Fatalf("book encoding metadata = %q, want %q", got, want)
+	}
+}
+
+func TestAssignRowFieldBookFallbackRaw(t *testing.T) {
 	row := parquetRow{}
-	if err := assignRowField(&row, "checksum", []byte{1, 2, 3}); err == nil {
-		t.Fatalf("assignRowField(checksum) error = nil, want non-nil")
+	payload := []byte("[[\"1\",\"2\"]]")
+	if err := assignRowField(&row, "bids", payload, compactBookScales{PxScale: 4, SzScale: 4}); err != nil {
+		t.Fatalf("assign bids: %v", err)
+	}
+	if got := string(row.BidsRaw); got != string(payload) {
+		t.Fatalf("bids raw = %q, want %q", got, payload)
+	}
+	if row.Bids != nil {
+		t.Fatalf("packed bids column should stay nil on raw fallback")
+	}
+}
+
+func TestWalkCompactBookLevelsParsesWhitespace(t *testing.T) {
+	payload := []byte(" [ [ \"65000.1\" , \"12.5\" , \"0\" , \"1\" ] , [ \"64999.9\" , \"0.0001000\" , \"1\" , \"4\" ] ] ")
+	var got [][]string
+	err := walkCompactBookLevels(payload, func(pxText, szText, liqText, ordersText []byte) error {
+		got = append(got, []string{
+			string(pxText),
+			string(szText),
+			string(liqText),
+			string(ordersText),
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walkCompactBookLevels() error = %v", err)
+	}
+	want := [][]string{
+		{"65000.1", "12.5", "0", "1"},
+		{"64999.9", "0.0001000", "1", "4"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("walkCompactBookLevels() = %v, want %v", got, want)
+	}
+}
+
+func TestWalkCompactBookLevelsEmptyBook(t *testing.T) {
+	calls := 0
+	err := walkCompactBookLevels([]byte(" [  ] "), func(_, _, _, _ []byte) error {
+		calls++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walkCompactBookLevels() error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("walkCompactBookLevels() callback calls = %d, want 0", calls)
+	}
+}
+
+func TestWalkCompactBookLevelsRejectsMalformedPayloads(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		wantErr string
+	}{
+		{
+			name:    "missing-field",
+			payload: "[[\"1\",\"2\",\"0\"]]",
+			wantErr: "expected ',' after liq",
+		},
+		{
+			name:    "extra-field",
+			payload: "[[\"1\",\"2\",\"0\",\"1\",\"extra\"]]",
+			wantErr: "expected ']' after level",
+		},
+		{
+			name:    "escaped-string",
+			payload: "[[\"1\\u0031\",\"2\",\"0\",\"1\"]]",
+			wantErr: "escaped string unsupported",
+		},
+		{
+			name:    "trailing-data",
+			payload: "[[\"1\",\"2\",\"0\",\"1\"]]x",
+			wantErr: "trailing data",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := walkCompactBookLevels([]byte(tt.payload), func(_, _, _, _ []byte) error {
+				return nil
+			})
+			if err == nil {
+				t.Fatalf("walkCompactBookLevels() error = nil, want substring %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("walkCompactBookLevels() error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestPackCompactBookPayloadEmptyBook(t *testing.T) {
+	packed, err := packCompactBookPayload([]byte(" [ ] "), compactBookScales{PxScale: 4, SzScale: 4})
+	if err != nil {
+		t.Fatalf("packCompactBookPayload() error = %v", err)
+	}
+	book, err := unpackCompactBookPayload(packed)
+	if err != nil {
+		t.Fatalf("unpackCompactBookPayload() error = %v", err)
+	}
+	if len(book.Px) != 0 || len(book.Sz) != 0 || len(book.Liq) != 0 || len(book.Orders) != 0 {
+		t.Fatalf("unpackCompactBookPayload() = %+v, want empty slices", book)
+	}
+}
+
+func TestDetectCompactBookSideScaleTrimsTrailingZeros(t *testing.T) {
+	payload := []byte("[[\"1.2300\",\"0.0100\",\"0\",\"1\"],[\"2\",\"3.000\",\"1\",\"2\"]]")
+	got, err := detectCompactBookSideScale(payload)
+	if err != nil {
+		t.Fatalf("detectCompactBookSideScale() error = %v", err)
+	}
+	want := compactBookScales{PxScale: 2, SzScale: 2}
+	if got != want {
+		t.Fatalf("detectCompactBookSideScale() = %+v, want %+v", got, want)
+	}
+}
+
+func TestPackCompactBookPayloadRoundTrip(t *testing.T) {
+	payload := []byte("[[\"65000.1234\",\"12.5000\",\"0\",\"1\"],[\"64999.9\",\"0.0001000\",\"1\",\"4\"]]")
+	packed, err := packCompactBookPayload(payload, compactBookScales{PxScale: 7, SzScale: 6})
+	if err != nil {
+		t.Fatalf("packCompactBookPayload() error = %v", err)
+	}
+	if got, want := packed[0], byte(compactBookPackedVersion); got != want {
+		t.Fatalf("packed version = %d, want %d", got, want)
+	}
+	book, err := unpackCompactBookPayload(packed)
+	if err != nil {
+		t.Fatalf("unpackCompactBookPayload() error = %v", err)
+	}
+	if got, want := book.Px, []int64{650001234000, 649999000000}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("px = %v, want %v", got, want)
+	}
+	if got, want := book.Sz, []int64{12500000, 100}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("sz = %v, want %v", got, want)
+	}
+	if got, want := book.Liq, []int64{0, 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("liq = %v, want %v", got, want)
+	}
+	if got, want := book.Orders, []int64{1, 4}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("orders = %v, want %v", got, want)
+	}
+}
+
+func TestUnpackCompactBookPayloadRejectsMalformed(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		wantErr string
+	}{
+		{name: "too-short", payload: []byte{1, 0, 0}, wantErr: "too short"},
+		{name: "bad-version", payload: []byte{2, 0, 0, 0, 0}, wantErr: "unsupported packed book version"},
+		{name: "bad-size", payload: []byte{1, 1, 0, 0, 0}, wantErr: "size mismatch"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := unpackCompactBookPayload(tt.payload)
+			if err == nil {
+				t.Fatalf("unpackCompactBookPayload() error = nil, want substring %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unpackCompactBookPayload() error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseScaledDecimalBytes(t *testing.T) {
+	tests := []struct {
+		name  string
+		text  string
+		scale int32
+		want  int64
+	}{
+		{name: "whole", text: "12", scale: 3, want: 12000},
+		{name: "trimmed-fraction", text: "1.2300", scale: 4, want: 12300},
+		{name: "negative", text: "-0.5", scale: 3, want: -500},
+		{name: "leading-dot", text: ".25", scale: 4, want: 2500},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseScaledDecimalBytes([]byte(tt.text), tt.scale)
+			if err != nil {
+				t.Fatalf("parseScaledDecimalBytes() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseScaledDecimalBytes() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func BenchmarkPackCompactBookPayload(b *testing.B) {
+	payload := []byte("[[\"65000.1234\",\"12.5000\",\"0\",\"1\"],[\"64999.9\",\"0.0001000\",\"1\",\"4\"],[\"64999.8\",\"0.0100\",\"0\",\"2\"]]")
+	scales := compactBookScales{PxScale: 7, SzScale: 6}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := packCompactBookPayload(payload, scales); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkUnpackCompactBookPayload(b *testing.B) {
+	packed, err := packCompactBookPayload(
+		[]byte("[[\"65000.1234\",\"12.5000\",\"0\",\"1\"],[\"64999.9\",\"0.0001000\",\"1\",\"4\"],[\"64999.8\",\"0.0100\",\"0\",\"2\"]]"),
+		compactBookScales{PxScale: 7, SzScale: 6},
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := unpackCompactBookPayload(packed); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDetectCompactBookSideScale(b *testing.B) {
+	payload := []byte("[[\"65000.1234\",\"12.5000\",\"0\",\"1\"],[\"64999.9\",\"0.0001000\",\"1\",\"4\"],[\"64999.8\",\"0.0100\",\"0\",\"2\"]]")
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := detectCompactBookSideScale(payload); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

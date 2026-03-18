@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -50,12 +51,18 @@ const (
 	// Keep zstd spool streams on a bounded-memory profile. We trade some peak
 	// throughput for predictable RAM usage when a source opens many field
 	// writers concurrently or when merge/build opens many readers at once.
-	spoolZstdWindowSize       = 1 << 20
-	spoolZstdDecoderMaxWindow = 128 << 20
-	spoolZstdDecoderMaxMemory = 256 << 20
-	buildMaxRowsPerRowGroup   = 65536
-	parquetPageBufferSize     = 1 << 20
-	parquetWriteBufferSize    = 1 << 20
+	spoolZstdWindowSize         = 1 << 20
+	spoolZstdDecoderMaxWindow   = 128 << 20
+	spoolZstdDecoderMaxMemory   = 256 << 20
+	buildWriteBatchRows         = 4096
+	buildMaxRowsPerRowGroup     = 65536
+	parquetPageBufferSize       = 1 << 20
+	parquetWriteBufferSize      = 1 << 20
+	compactBookScaleSampleRows  = 10
+	compactBookScaleSpareDigits = 2
+	compactBookPackedVersion    = 1
+	compactBookPackedHeaderSize = 5
+	compactBookPackedLevelSize  = 32
 )
 
 var (
@@ -351,13 +358,41 @@ type buildProgress struct {
 	Every        time.Duration
 }
 
+type pendingBuildRow struct {
+	TimeNS        int64
+	ActionPayload []byte
+	HasAction     bool
+	AsksPayload   []byte
+	HasAsks       bool
+	BidsPayload   []byte
+	HasBids       bool
+	Checksum      []byte
+	HasChecksum   bool
+	TSPayload     []byte
+	HasTS         bool
+}
+
 type parquetRow struct {
-	Time     int64   `parquet:"time,timestamp(nanosecond:utc)"`
-	Action   *string `parquet:"action,optional"`
-	Asks     *string `parquet:"asks,optional"`
-	Bids     *string `parquet:"bids,optional"`
-	Checksum *int64  `parquet:"checksum,optional"`
-	TS       *string `parquet:"ts,optional"`
+	Time     int64  `parquet:"time,timestamp(nanosecond:utc)"`
+	Action   *int32 `parquet:"action,optional"`
+	AsksRaw  []byte `parquet:"asksRaw,optional"`
+	Asks     []byte `parquet:"asks,optional"`
+	BidsRaw  []byte `parquet:"bidsRaw,optional"`
+	Bids     []byte `parquet:"bids,optional"`
+	Checksum *int64 `parquet:"checksum,optional"`
+	TS       *int64 `parquet:"ts,optional"`
+}
+
+type compactBookScales struct {
+	PxScale int32
+	SzScale int32
+}
+
+type compactBookSide struct {
+	Px     []int64
+	Sz     []int64
+	Liq    []int64
+	Orders []int64
 }
 
 func main() {
@@ -2172,6 +2207,10 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 		bytesWritten int64
 		minTimeNS    *int64
 		maxTimeNS    *int64
+		partFile     *os.File
+		partWriter   *parquet.GenericWriter[parquetRow]
+		partPath     string
+		rowsInPart   int
 	)
 	progress := buildProgress{
 		InstID:      instID,
@@ -2180,12 +2219,64 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 		Every:       cfg.ProgressInterval,
 	}
 
-	flush := func() error {
+	writerOptions, err := parquetWriterOptions(cfg.Compression, cfg.CompressionLevel)
+	if err != nil {
+		return buildResult{}, err
+	}
+	sampleRows := make([]pendingBuildRow, 0, compactBookScaleSampleRows)
+	for hasCurrent(current) && len(sampleRows) < compactBookScaleSampleRows {
+		row, err := nextPendingBuildRow(current, readers)
+		if err != nil {
+			return buildResult{}, err
+		}
+		sampleRows = append(sampleRows, row)
+	}
+	bookScales := detectCompactBookScales(sampleRows)
+	metadata := compactBookMetadata(instID, bookScales)
+
+	openPart := func() error {
+		if partWriter != nil {
+			return nil
+		}
+		partPath = filepath.Join(stageDataset, fmt.Sprintf("part-%05d.parquet", partIndex))
+		file, err := os.Create(partPath)
+		if err != nil {
+			return err
+		}
+		partFile = file
+		partWriter = parquet.NewGenericWriter[parquetRow](file, writerOptions...)
+		for key, value := range metadata {
+			partWriter.SetKeyValueMetadata(key, value)
+		}
+		rowsInPart = 0
+		return nil
+	}
+
+	flushChunk := func() error {
 		if len(buffer) == 0 {
 			return nil
 		}
-		partPath := filepath.Join(stageDataset, fmt.Sprintf("part-%05d.parquet", partIndex))
-		if err := writeParquetPart(partPath, buffer, cfg.Compression, cfg.CompressionLevel); err != nil {
+		if err := openPart(); err != nil {
+			return err
+		}
+		if _, err := partWriter.Write(buffer); err != nil {
+			return err
+		}
+		buffer = buffer[:0]
+		return nil
+	}
+
+	closePart := func() error {
+		if err := flushChunk(); err != nil {
+			return err
+		}
+		if partWriter == nil {
+			return nil
+		}
+		if err := partWriter.Close(); err != nil {
+			return err
+		}
+		if err := partFile.Close(); err != nil {
 			return err
 		}
 		info, err := os.Stat(partPath)
@@ -2196,47 +2287,83 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 		partIndex++
 		progress.PartCount = partIndex
 		progress.BytesWritten = bytesWritten
-		buffer = buffer[:0]
+		partWriter = nil
+		partFile = nil
+		partPath = ""
+		rowsInPart = 0
 		return nil
 	}
 
-	for hasCurrent(current) {
-		nextTimestamp := nextTimestamp(current)
+	appendRow := func(raw pendingBuildRow) error {
 		row := parquetRow{
-			Time: nextTimestamp,
+			Time: raw.TimeNS,
 		}
-		for field, record := range current {
-			if record == nil || record.TimestampNS != nextTimestamp {
-				continue
+		if raw.HasAction {
+			if err := assignRowField(&row, "action", raw.ActionPayload, bookScales); err != nil {
+				return err
 			}
-			if err := assignRowField(&row, field, record.Payload); err != nil {
-				return buildResult{}, err
+		}
+		if raw.HasAsks {
+			if err := assignRowField(&row, "asks", raw.AsksPayload, bookScales); err != nil {
+				return err
 			}
-			nextRecord, err := readers[field].Advance()
-			if err != nil {
-				return buildResult{}, err
+		}
+		if raw.HasBids {
+			if err := assignRowField(&row, "bids", raw.BidsPayload, bookScales); err != nil {
+				return err
 			}
-			current[field] = nextRecord
+		}
+		if raw.HasChecksum {
+			if err := assignRowField(&row, "checksum", raw.Checksum, bookScales); err != nil {
+				return err
+			}
+		}
+		if raw.HasTS {
+			if err := assignRowField(&row, "ts", raw.TSPayload, bookScales); err != nil {
+				return err
+			}
 		}
 		buffer = append(buffer, row)
+		rowsInPart++
 		rowsWritten++
 		progress.Rows = rowsWritten
-		progress.LastTimeNS = nextTimestamp
+		progress.LastTimeNS = raw.TimeNS
 		progress.HasLastTime = true
-		if minTimeNS == nil || nextTimestamp < *minTimeNS {
-			minTimeNS = ptrInt64(nextTimestamp)
+		if minTimeNS == nil || raw.TimeNS < *minTimeNS {
+			minTimeNS = ptrInt64(raw.TimeNS)
 		}
-		if maxTimeNS == nil || nextTimestamp > *maxTimeNS {
-			maxTimeNS = ptrInt64(nextTimestamp)
+		if maxTimeNS == nil || raw.TimeNS > *maxTimeNS {
+			maxTimeNS = ptrInt64(raw.TimeNS)
 		}
-		if len(buffer) >= cfg.RowsPerFile {
-			if err := flush(); err != nil {
-				return buildResult{}, err
+		if len(buffer) >= buildWriteBatchRows {
+			if err := flushChunk(); err != nil {
+				return err
+			}
+		}
+		if rowsInPart >= cfg.RowsPerFile {
+			if err := closePart(); err != nil {
+				return err
 			}
 		}
 		progress.maybePrint()
+		return nil
 	}
-	if err := flush(); err != nil {
+
+	for _, row := range sampleRows {
+		if err := appendRow(row); err != nil {
+			return buildResult{}, err
+		}
+	}
+	for hasCurrent(current) {
+		row, err := nextPendingBuildRow(current, readers)
+		if err != nil {
+			return buildResult{}, err
+		}
+		if err := appendRow(row); err != nil {
+			return buildResult{}, err
+		}
+	}
+	if err := closePart(); err != nil {
 		return buildResult{}, err
 	}
 
@@ -2247,7 +2374,7 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 	if err := os.Rename(stageDataset, finalDataset); err != nil {
 		return buildResult{}, err
 	}
-	if err := writeDatasetSummary(finalDataset, instID, rowsWritten, partIndex, bytesWritten, minTimeNS, maxTimeNS, cfg); err != nil {
+	if err := writeDatasetSummary(finalDataset, instID, rowsWritten, partIndex, bytesWritten, minTimeNS, maxTimeNS, cfg, metadata); err != nil {
 		return buildResult{}, err
 	}
 
@@ -2264,7 +2391,7 @@ func buildDataset(paths workLayout, cfg config, state *pipelineState, instID str
 	}, nil
 }
 
-func writeDatasetSummary(datasetPath, instID string, rows int64, partCount int, bytesWritten int64, minTimeNS, maxTimeNS *int64, cfg config) error {
+func writeDatasetSummary(datasetPath, instID string, rows int64, partCount int, bytesWritten int64, minTimeNS, maxTimeNS *int64, cfg config, metadata map[string]string) error {
 	summary := map[string]any{
 		"measurement":        measurement,
 		"inst_id":            instID,
@@ -2279,8 +2406,26 @@ func writeDatasetSummary(datasetPath, instID string, rows int64, partCount int, 
 		"max_time_ns":        maxTimeNS,
 		"min_time":           formatNS(minTimeNS),
 		"max_time":           formatNS(maxTimeNS),
+		"parquet_metadata":   metadata,
 	}
 	return saveJSON(filepath.Join(datasetPath, "summary.json"), summary)
+}
+
+func compactBookMetadata(instID string, scales compactBookScales) map[string]string {
+	return map[string]string{
+		"okex_depth.inst_id":            instID,
+		"okex_depth.asks_px_scale":      strconv.FormatInt(int64(scales.PxScale), 10),
+		"okex_depth.asks_sz_scale":      strconv.FormatInt(int64(scales.SzScale), 10),
+		"okex_depth.bids_px_scale":      strconv.FormatInt(int64(scales.PxScale), 10),
+		"okex_depth.bids_sz_scale":      strconv.FormatInt(int64(scales.SzScale), 10),
+		"okex_depth.scale_sample_rows":  strconv.Itoa(compactBookScaleSampleRows),
+		"okex_depth.scale_spare_digits": strconv.Itoa(compactBookScaleSpareDigits),
+		"okex_depth.action.snapshot":    "1",
+		"okex_depth.action.update":      "2",
+		"okex_depth.book_encoding":      "packed_i64le_v1",
+		"okex_depth.book_schema":        "version:u8,count:u32le,repeated(px:i64le,sz:i64le,liq:i64le,num_orders:i64le)",
+		"okex_depth.raw_fallback_col":   "asksRaw,bidsRaw",
+	}
 }
 
 func writeParquetPart(path string, rows []parquetRow, compression string, compressionLevel int) error {
@@ -2639,19 +2784,23 @@ func encodeValue(field string, value tsm1.Value) ([]byte, error) {
 	return []byte(text), nil
 }
 
-func assignRowField(row *parquetRow, field string, payload []byte) error {
+func assignRowField(row *parquetRow, field string, payload []byte, bookScales compactBookScales) error {
 	switch field {
 	case "action":
-		value := string(payload)
+		value, err := parseActionCode(payload)
+		if err != nil {
+			return err
+		}
 		row.Action = &value
 	case "asks":
-		value := string(payload)
-		row.Asks = &value
+		assignCompactBookField(row, "asks", payload, bookScales)
 	case "bids":
-		value := string(payload)
-		row.Bids = &value
+		assignCompactBookField(row, "bids", payload, bookScales)
 	case "ts":
-		value := string(payload)
+		value, err := parseDecimalInt64(payload, "ts")
+		if err != nil {
+			return err
+		}
 		row.TS = &value
 	case "checksum":
 		if len(payload) != 8 {
@@ -2663,6 +2812,441 @@ func assignRowField(row *parquetRow, field string, payload []byte) error {
 		return fmt.Errorf("unknown field %q", field)
 	}
 	return nil
+}
+
+func assignCompactBookField(row *parquetRow, field string, payload []byte, bookScales compactBookScales) {
+	packed, err := packCompactBookPayload(payload, bookScales)
+	if err != nil {
+		switch field {
+		case "asks":
+			row.AsksRaw = append([]byte(nil), payload...)
+		case "bids":
+			row.BidsRaw = append([]byte(nil), payload...)
+		}
+		return
+	}
+
+	switch field {
+	case "asks":
+		row.Asks = packed
+	case "bids":
+		row.Bids = packed
+	}
+}
+
+func packCompactBookPayload(payload []byte, scales compactBookScales) ([]byte, error) {
+	packed := make([]byte, compactBookPackedHeaderSize, compactBookPackedHeaderSize+64*compactBookPackedLevelSize)
+	packed[0] = compactBookPackedVersion
+	levelCount := 0
+	err := walkCompactBookLevels(payload, func(pxText, szText, liqText, ordersText []byte) error {
+		px, err := parseScaledDecimalBytes(pxText, scales.PxScale)
+		if err != nil {
+			return fmt.Errorf("parse scaled price %q: %w", pxText, err)
+		}
+		sz, err := parseScaledDecimalBytes(szText, scales.SzScale)
+		if err != nil {
+			return fmt.Errorf("parse scaled size %q: %w", szText, err)
+		}
+		liq, err := parseInt64Bytes(liqText)
+		if err != nil {
+			return fmt.Errorf("parse liq %q: %w", liqText, err)
+		}
+		orders, err := parseInt64Bytes(ordersText)
+		if err != nil {
+			return fmt.Errorf("parse orders %q: %w", ordersText, err)
+		}
+		packed = appendPackedInt64(packed, px)
+		packed = appendPackedInt64(packed, sz)
+		packed = appendPackedInt64(packed, liq)
+		packed = appendPackedInt64(packed, orders)
+		levelCount++
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if levelCount > int(^uint32(0)) {
+		return nil, fmt.Errorf("packed book has too many levels: %d", levelCount)
+	}
+	binary.LittleEndian.PutUint32(packed[1:compactBookPackedHeaderSize], uint32(levelCount))
+	return packed, nil
+}
+
+func unpackCompactBookPayload(payload []byte) (*compactBookSide, error) {
+	if len(payload) < compactBookPackedHeaderSize {
+		return nil, fmt.Errorf("packed book payload too short: %d", len(payload))
+	}
+	if payload[0] != compactBookPackedVersion {
+		return nil, fmt.Errorf("unsupported packed book version: %d", payload[0])
+	}
+	levelCount := int(binary.LittleEndian.Uint32(payload[1:compactBookPackedHeaderSize]))
+	expectedSize := compactBookPackedHeaderSize + levelCount*compactBookPackedLevelSize
+	if len(payload) != expectedSize {
+		return nil, fmt.Errorf("packed book payload size mismatch: got=%d want=%d", len(payload), expectedSize)
+	}
+	book := &compactBookSide{
+		Px:     make([]int64, levelCount),
+		Sz:     make([]int64, levelCount),
+		Liq:    make([]int64, levelCount),
+		Orders: make([]int64, levelCount),
+	}
+	offset := compactBookPackedHeaderSize
+	for index := 0; index < levelCount; index++ {
+		book.Px[index] = int64(binary.LittleEndian.Uint64(payload[offset : offset+8]))
+		offset += 8
+		book.Sz[index] = int64(binary.LittleEndian.Uint64(payload[offset : offset+8]))
+		offset += 8
+		book.Liq[index] = int64(binary.LittleEndian.Uint64(payload[offset : offset+8]))
+		offset += 8
+		book.Orders[index] = int64(binary.LittleEndian.Uint64(payload[offset : offset+8]))
+		offset += 8
+	}
+	return book, nil
+}
+
+func appendPackedInt64(dst []byte, value int64) []byte {
+	var scratch [8]byte
+	binary.LittleEndian.PutUint64(scratch[:], uint64(value))
+	return append(dst, scratch[:]...)
+}
+
+func nextPendingBuildRow(current map[string]*spoolRecord, readers map[string]*collapsedSpoolReader) (pendingBuildRow, error) {
+	if !hasCurrent(current) {
+		return pendingBuildRow{}, io.EOF
+	}
+	nextTimeNS := nextTimestamp(current)
+	row := pendingBuildRow{
+		TimeNS: nextTimeNS,
+	}
+	for field, record := range current {
+		if record == nil || record.TimestampNS != nextTimeNS {
+			continue
+		}
+		switch field {
+		case "action":
+			row.ActionPayload = record.Payload
+			row.HasAction = true
+		case "asks":
+			row.AsksPayload = record.Payload
+			row.HasAsks = true
+		case "bids":
+			row.BidsPayload = record.Payload
+			row.HasBids = true
+		case "checksum":
+			row.Checksum = record.Payload
+			row.HasChecksum = true
+		case "ts":
+			row.TSPayload = record.Payload
+			row.HasTS = true
+		}
+		nextRecord, err := readers[field].Advance()
+		if err != nil {
+			return pendingBuildRow{}, err
+		}
+		current[field] = nextRecord
+	}
+	return row, nil
+}
+
+func detectCompactBookScales(rows []pendingBuildRow) compactBookScales {
+	var maxPxScale int32
+	var maxSzScale int32
+	for _, row := range rows {
+		for _, payload := range [][]byte{row.AsksPayload, row.BidsPayload} {
+			if len(payload) == 0 {
+				continue
+			}
+			scales, err := detectCompactBookSideScale(payload)
+			if err != nil {
+				continue
+			}
+			if scales.PxScale > maxPxScale {
+				maxPxScale = scales.PxScale
+			}
+			if scales.SzScale > maxSzScale {
+				maxSzScale = scales.SzScale
+			}
+		}
+	}
+	return compactBookScales{
+		PxScale: maxPxScale + compactBookScaleSpareDigits,
+		SzScale: maxSzScale + compactBookScaleSpareDigits,
+	}
+}
+
+func detectCompactBookSideScale(payload []byte) (compactBookScales, error) {
+	var scales compactBookScales
+	err := walkCompactBookLevels(payload, func(pxText, szText, _, _ []byte) error {
+		pxScale, err := detectDecimalScaleBytes(pxText)
+		if err != nil {
+			return fmt.Errorf("detect price scale %q: %w", pxText, err)
+		}
+		szScale, err := detectDecimalScaleBytes(szText)
+		if err != nil {
+			return fmt.Errorf("detect size scale %q: %w", szText, err)
+		}
+		if pxScale > scales.PxScale {
+			scales.PxScale = pxScale
+		}
+		if szScale > scales.SzScale {
+			scales.SzScale = szScale
+		}
+		return nil
+	})
+	if err != nil {
+		return compactBookScales{}, err
+	}
+	return scales, nil
+}
+
+func parseActionCode(payload []byte) (int32, error) {
+	switch string(payload) {
+	case "snapshot":
+		return 1, nil
+	case "update":
+		return 2, nil
+	default:
+		return 0, fmt.Errorf("unknown action payload: %q", payload)
+	}
+}
+
+func parseDecimalInt64(payload []byte, field string) (int64, error) {
+	value, err := strconv.ParseInt(string(payload), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s payload %q: %w", field, payload, err)
+	}
+	return value, nil
+}
+
+func walkCompactBookLevels(payload []byte, visit func(pxText, szText, liqText, ordersText []byte) error) error {
+	index := skipJSONSpace(payload, 0)
+	if index >= len(payload) || payload[index] != '[' {
+		return fmt.Errorf("decode book payload: expected '['")
+	}
+	index++
+	index = skipJSONSpace(payload, index)
+	if index < len(payload) && payload[index] == ']' {
+		index++
+		if skipJSONSpace(payload, index) != len(payload) {
+			return fmt.Errorf("decode book payload: trailing data")
+		}
+		return nil
+	}
+	for {
+		index = skipJSONSpace(payload, index)
+		if index >= len(payload) || payload[index] != '[' {
+			return fmt.Errorf("decode book payload: expected '[' for level")
+		}
+		index++
+
+		pxText, next, err := readCompactJSONString(payload, index)
+		if err != nil {
+			return err
+		}
+		index = skipJSONSpace(payload, next)
+		if index >= len(payload) || payload[index] != ',' {
+			return fmt.Errorf("decode book payload: expected ',' after px")
+		}
+		index++
+
+		szText, next, err := readCompactJSONString(payload, index)
+		if err != nil {
+			return err
+		}
+		index = skipJSONSpace(payload, next)
+		if index >= len(payload) || payload[index] != ',' {
+			return fmt.Errorf("decode book payload: expected ',' after sz")
+		}
+		index++
+
+		liqText, next, err := readCompactJSONString(payload, index)
+		if err != nil {
+			return err
+		}
+		index = skipJSONSpace(payload, next)
+		if index >= len(payload) || payload[index] != ',' {
+			return fmt.Errorf("decode book payload: expected ',' after liq")
+		}
+		index++
+
+		ordersText, next, err := readCompactJSONString(payload, index)
+		if err != nil {
+			return err
+		}
+		index = skipJSONSpace(payload, next)
+		if index >= len(payload) || payload[index] != ']' {
+			return fmt.Errorf("decode book payload: expected ']' after level")
+		}
+		index++
+
+		if err := visit(pxText, szText, liqText, ordersText); err != nil {
+			return err
+		}
+
+		index = skipJSONSpace(payload, index)
+		if index >= len(payload) {
+			return fmt.Errorf("decode book payload: unexpected end")
+		}
+		switch payload[index] {
+		case ',':
+			index++
+		case ']':
+			index++
+			if skipJSONSpace(payload, index) != len(payload) {
+				return fmt.Errorf("decode book payload: trailing data")
+			}
+			return nil
+		default:
+			return fmt.Errorf("decode book payload: expected ',' or ']'")
+		}
+	}
+}
+
+func readCompactJSONString(payload []byte, index int) ([]byte, int, error) {
+	index = skipJSONSpace(payload, index)
+	if index >= len(payload) || payload[index] != '"' {
+		return nil, 0, fmt.Errorf("decode book payload: expected string")
+	}
+	start := index + 1
+	for index = start; index < len(payload); index++ {
+		switch payload[index] {
+		case '"':
+			return payload[start:index], index + 1, nil
+		case '\\':
+			return nil, 0, fmt.Errorf("decode book payload: escaped string unsupported")
+		}
+	}
+	return nil, 0, fmt.Errorf("decode book payload: unterminated string")
+}
+
+func skipJSONSpace(payload []byte, index int) int {
+	for index < len(payload) {
+		switch payload[index] {
+		case ' ', '\t', '\r', '\n':
+			index++
+		default:
+			return index
+		}
+	}
+	return index
+}
+
+func parseScaledDecimalBytes(text []byte, scale int32) (int64, error) {
+	sign, whole, frac, err := splitDecimalBytes(text)
+	if err != nil {
+		return 0, err
+	}
+	if len(frac) > int(scale) {
+		return 0, fmt.Errorf("decimal %q exceeds scale %d", text, scale)
+	}
+	value, err := parseDigitsIntoInt64(whole)
+	if err != nil {
+		return 0, err
+	}
+	for _, digit := range frac {
+		if value > (math.MaxInt64-int64(digit-'0'))/10 {
+			return 0, fmt.Errorf("decimal %q overflows int64", text)
+		}
+		value = value*10 + int64(digit-'0')
+	}
+	for pad := len(frac); pad < int(scale); pad++ {
+		if value > math.MaxInt64/10 {
+			return 0, fmt.Errorf("decimal %q overflows int64", text)
+		}
+		value *= 10
+	}
+	return sign * value, nil
+}
+
+func detectDecimalScaleBytes(text []byte) (int32, error) {
+	_, _, frac, err := splitDecimalBytes(text)
+	if err != nil {
+		return 0, err
+	}
+	return int32(len(frac)), nil
+}
+
+func splitDecimalBytes(text []byte) (int64, []byte, []byte, error) {
+	if len(text) == 0 {
+		return 0, nil, nil, fmt.Errorf("empty decimal")
+	}
+	sign := int64(1)
+	body := text
+	switch body[0] {
+	case '+':
+		body = body[1:]
+	case '-':
+		sign = -1
+		body = body[1:]
+	}
+	if len(body) == 0 {
+		return 0, nil, nil, fmt.Errorf("invalid decimal %q", text)
+	}
+	dot := bytes.IndexByte(body, '.')
+	var whole []byte
+	var frac []byte
+	if dot < 0 {
+		whole = body
+	} else {
+		whole = body[:dot]
+		frac = body[dot+1:]
+	}
+	if len(whole) == 0 && len(frac) == 0 {
+		return 0, nil, nil, fmt.Errorf("invalid decimal %q", text)
+	}
+	if !allDecimalDigitsBytes(whole) || !allDecimalDigitsBytes(frac) {
+		return 0, nil, nil, fmt.Errorf("invalid decimal digits %q", text)
+	}
+	for len(frac) > 0 && frac[len(frac)-1] == '0' {
+		frac = frac[:len(frac)-1]
+	}
+	return sign, whole, frac, nil
+}
+
+func parseInt64Bytes(text []byte) (int64, error) {
+	if len(text) == 0 {
+		return 0, fmt.Errorf("empty integer")
+	}
+	sign := int64(1)
+	body := text
+	switch body[0] {
+	case '+':
+		body = body[1:]
+	case '-':
+		sign = -1
+		body = body[1:]
+	}
+	if len(body) == 0 || !allDecimalDigitsBytes(body) {
+		return 0, fmt.Errorf("invalid integer %q", text)
+	}
+	value, err := parseDigitsIntoInt64(body)
+	if err != nil {
+		return 0, err
+	}
+	return sign * value, nil
+}
+
+func parseDigitsIntoInt64(digits []byte) (int64, error) {
+	var value int64
+	for _, digit := range digits {
+		if digit < '0' || digit > '9' {
+			return 0, fmt.Errorf("invalid integer digits %q", digits)
+		}
+		if value > (math.MaxInt64-int64(digit-'0'))/10 {
+			return 0, fmt.Errorf("integer %q overflows int64", digits)
+		}
+		value = value*10 + int64(digit-'0')
+	}
+	return value, nil
+}
+
+func allDecimalDigitsBytes(text []byte) bool {
+	for _, digit := range text {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func mergedSignatureForInst(state *pipelineState, instID string) map[string]mergedFieldSignature {

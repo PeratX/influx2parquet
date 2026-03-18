@@ -130,23 +130,42 @@ Go 版流水线分 4 个阶段：
 - `time`
   Parquet `timestamp(nanosecond:utc)`，对应记录时间。
 - `action`
-  `string`，原始值如 `snapshot` / `update`。
+  `int32` 枚举：
+  - `1 = snapshot`
+  - `2 = update`
 - `asks`
-  `string`，直接保留原始盘口 JSON 文本，例如 `[[\"65000.1\",\"12.5\",\"0\",\"1\"], ...]`。
+  `binary`，packed book bytes。价格和数量仍然依赖 dataset metadata 里的 `okex_depth.asks_px_scale` / `okex_depth.asks_sz_scale` 还原。
 - `bids`
-  `string`，直接保留原始盘口 JSON 文本。
+  `binary`，packed book bytes。价格和数量仍然依赖 dataset metadata 里的 `okex_depth.bids_px_scale` / `okex_depth.bids_sz_scale` 还原。
+- `asksRaw` / `bidsRaw`
+  `binary` fallback。只有在某一行 payload 不能安全解析成标准 4 字段盘口档位时才会写入，用来保底精确保留原始内容。
 - `checksum`
   `int64`
 - `ts`
-  `string`，保留原始字符串时间戳。
+  `int64`，从原始字符串 payload 解析出来的数值时间戳。
 
-当前格式回到直接 JSON 文本存储：
+`instId` 和缩放位不再作为每行列重复写入，而是放在：
 
-- `instId` 不再按行重复写入；每个 dataset 目录本身就对应一个 `instId`
-- 不依赖 parquet metadata 里的额外 scale 信息
-- 不再使用 packed binary 或结构化盘口编码
-- `asks` / `bids` 可以直接被 DuckDB、PyArrow、Polars 或自定义脚本按 JSON 文本解析
-- 文件体积会更大，但写入路径更简单，也更接近最初的高吞吐版本
+- 每个 parquet part 的 key-value metadata
+- dataset 目录下的 `summary.json`
+
+这意味着最终格式不再是“把整段盘口 JSON 文本塞进一列”，而是：
+
+- `action` / `ts` / `checksum` 变成真正的整数列
+- `asks` / `bids` 变成 packed binary 列，而不是高开销的嵌套 list 列
+- 每个 `instId` dataset 会先采样前 10 行盘口，取观测到的小数位最大值后额外留 2 位余量，再把结果写进 metadata
+- BTC 这类高价合约和低价小数品种会各自用更合适的 metadata scale，而不是统一固定 `1e9`
+- `instId` 和 decimal scale 进入文件 metadata
+- 只有遇到异常 payload 时，才回退到 `asksRaw` / `bidsRaw`
+
+packed binary 的当前布局是：
+
+- `version:u8`
+- `count:u32le`
+- 重复 `count` 次的 level 记录
+- 每个 level 是 `px:i64le, sz:i64le, liq:i64le, num_orders:i64le`
+
+这样比原始字符串/二进制文本更紧凑，也更适合 DuckDB、PyArrow、Polars 之类工具直接分析。
 
 如果你需要在 Python 里读取并把结构化盘口重建回可读数组，可以直接参考：
 
@@ -154,9 +173,10 @@ Go 版流水线分 4 个阶段：
 
 这个读取脚本只面向当前这版 schema：
 
-- `instId` 不在每行列里；默认从 dataset 目录名理解
-- `asks` / `bids` 是原始 JSON 文本
-- `--decode-book` 会把盘口文本解析成数组
+- `instId` 不在每行列里
+- scale 不在每行列里
+- `asks` / `bids` 是 packed binary
+- 盘口价格和数量都依赖 parquet metadata 里的 `okex_depth.*_scale` 还原
 
 示例：
 
@@ -188,7 +208,7 @@ Go 版流水线分 4 个阶段：
   在 `merge` 完成后检查 `_merged_go` 是否足够可靠，帮助判断 `_raw_go` 是否可以手动删除。只检查，不删除。
 
 - [python/read_okex_depth_compact_parquet.py](python/read_okex_depth_compact_parquet.py)
-  读取当前 `okex_depth` Parquet 格式，并可把 `asks` / `bids` 的原始 JSON 文本解析成数组。
+  读取当前 `okex_depth` 紧凑 Parquet 格式，并按 parquet metadata 里的 scale 把结构化 `asks` / `bids` 重建成文本或 JSON。
 
 - [python/compare_parquet_sizes.py](python/compare_parquet_sizes.py)
   统计导出后 Parquet 的真实落盘体积、Parquet 元数据中的压缩前大小、节省空间和压缩比。

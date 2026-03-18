@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
@@ -91,6 +92,30 @@ def parse_args() -> argparse.Namespace:
         help=(
             "replay raw source fragments using the same merge ordering as Go code and "
             "compare every merged record; slower but strongest check"
+        ),
+    )
+    parser.add_argument(
+        "--sample-verify",
+        type=int,
+        default=0,
+        help=(
+            "lightweight replay mode: verify replayed row count from raw and compare only "
+            "sampled merged rows per instId/field"
+        ),
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=20260318,
+        help="random seed for --sample-verify, default: %(default)s",
+    )
+    parser.add_argument(
+        "--fast-verify-head",
+        type=int,
+        default=0,
+        help=(
+            "very fast mode: do not count full merged files and do not replay full raw; "
+            "only verify state/source mapping plus the first N merged rows per instId/field"
         ),
     )
     parser.add_argument(
@@ -228,12 +253,16 @@ def validate_merge(
     selected_inst_ids: set[str],
     selected_fields: set[str],
     verify_content: bool,
+    sample_verify: int,
+    sample_seed: int,
+    fast_verify_head: int,
 ) -> Tuple[List[ValidationIssue], Dict[str, int]]:
     issues: List[ValidationIssue] = []
     stats: Dict[str, int] = {
         "complete_sources": 0,
         "merge_checks": 0,
         "merged_rows": 0,
+        "state_merged_rows": 0,
         "raw_input_rows": 0,
     }
 
@@ -346,6 +375,7 @@ def validate_merge(
 
             merged_path = Path(entry.get("dest_path") or (merged_root / inst_id / f"{field}.bin.zst"))
             expected_rows = int(entry.get("row_count", 0))
+            stats["state_merged_rows"] += expected_rows
 
             if expected_source_count == 0:
                 ensure(
@@ -362,6 +392,25 @@ def validate_merge(
 
             ensure(merged_path.exists(), issues, f"missing merged file: {merged_path}")
             if not merged_path.exists():
+                continue
+
+            if fast_verify_head > 0:
+                source_paths = [Path(item.raw_dir) / inst_id / f"{field}.bin.zst" for item in source_list]
+                expected_head = take_first_expected_rows(source_paths, field, fast_verify_head)
+                merged_head = take_first_merged_rows(merged_path, field, fast_verify_head, issues, inst_id, field)
+                ensure(
+                    len(merged_head) == len(expected_head),
+                    issues,
+                    f"fast head verify length mismatch for {inst_id}/{field}: "
+                    f"merged={len(merged_head)} expected={len(expected_head)}",
+                )
+                for row_index, (merged_item, expected_item) in enumerate(zip(merged_head, expected_head), start=1):
+                    ensure(
+                        merged_item == expected_item,
+                        issues,
+                        f"fast head verify mismatch for {inst_id}/{field} at row={row_index}: "
+                        f"merged={truncate_record(merged_item)} expected={truncate_record(expected_item)}",
+                    )
                 continue
 
             merged_count = 0
@@ -392,6 +441,42 @@ def validate_merge(
             )
 
             if not verify_content:
+                if sample_verify <= 0:
+                    continue
+
+                source_paths = [Path(item.raw_dir) / inst_id / f"{field}.bin.zst" for item in source_list]
+                rng = random.Random(f"{sample_seed}:{inst_id}:{field}")
+                sample_targets = choose_sample_targets(merged_count, sample_verify, rng)
+                expected_iter = merged_records_from_sources(source_paths, field)
+                sample_expected: Dict[int, Tuple[int, object]] = {}
+                replay_count = 0
+                for replay_count, expected_item in enumerate(expected_iter, start=1):
+                    if replay_count in sample_targets:
+                        sample_expected[replay_count] = expected_item
+
+                ensure(
+                    replay_count == merged_count,
+                    issues,
+                    f"merge replay count mismatch for {inst_id}/{field}: replay={replay_count} merged={merged_count}",
+                )
+                if replay_count != merged_count:
+                    continue
+
+                sample_actual = read_sampled_merged_rows(merged_path, field, sample_targets)
+                ensure(
+                    set(sample_actual) == sample_targets,
+                    issues,
+                    f"merged sample rows missing for {inst_id}/{field}: "
+                    f"expected={sorted(sample_targets)} actual={sorted(sample_actual)}",
+                )
+                for row in sorted(sample_targets):
+                    ensure(
+                        sample_actual.get(row) == sample_expected.get(row),
+                        issues,
+                        f"merge sample mismatch for {inst_id}/{field} at row={row}: "
+                        f"merged={truncate_record(sample_actual.get(row))} "
+                        f"expected={truncate_record(sample_expected.get(row))}",
+                    )
                 continue
 
             source_paths = [Path(item.raw_dir) / inst_id / f"{field}.bin.zst" for item in source_list]
@@ -445,6 +530,78 @@ def truncate_record(record: Optional[Tuple[int, object]], limit: int = 120) -> s
     return f"({timestamp_ns}, {text})"
 
 
+def choose_sample_targets(total_rows: int, sample_count: int, rng: random.Random) -> set[int]:
+    if total_rows <= 0 or sample_count <= 0:
+        return set()
+    targets = {1, total_rows}
+    if total_rows <= sample_count:
+        return set(range(1, total_rows + 1))
+    middle_target = (total_rows + 1) // 2
+    targets.add(middle_target)
+    while len(targets) < min(sample_count, total_rows):
+        targets.add(rng.randint(1, total_rows))
+    return targets
+
+
+def read_sampled_merged_rows(path: Path, field: str, targets: set[int]) -> Dict[int, Tuple[int, object]]:
+    if not targets:
+        return {}
+    wanted = sorted(targets)
+    next_index = 0
+    found: Dict[int, Tuple[int, object]] = {}
+    for row_index, record in enumerate(iter_new_records(path, field), start=1):
+        while next_index < len(wanted) and wanted[next_index] < row_index:
+            next_index += 1
+        if next_index >= len(wanted):
+            break
+        if wanted[next_index] == row_index:
+            found[row_index] = record
+            next_index += 1
+            if next_index >= len(wanted):
+                break
+    return found
+
+
+def take_first_expected_rows(source_paths: Sequence[Path], field: str, limit: int) -> List[Tuple[int, object]]:
+    rows: List[Tuple[int, object]] = []
+    if limit <= 0:
+        return rows
+    for record in merged_records_from_sources(source_paths, field):
+        rows.append(record)
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def take_first_merged_rows(
+    path: Path,
+    field: str,
+    limit: int,
+    issues: List[ValidationIssue],
+    inst_id: str,
+    field_name: str,
+) -> List[Tuple[int, object]]:
+    rows: List[Tuple[int, object]] = []
+    previous_ts: Optional[int] = None
+    if limit <= 0:
+        return rows
+    for timestamp_ns, value in iter_new_records(path, field):
+        if previous_ts is not None and timestamp_ns <= previous_ts:
+            issues.append(
+                ValidationIssue(
+                    "error",
+                    f"merged timestamps not strictly increasing for {inst_id}/{field_name}: "
+                    f"{previous_ts} -> {timestamp_ns}",
+                )
+            )
+            break
+        previous_ts = timestamp_ns
+        rows.append((timestamp_ns, value))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
 def main() -> int:
     args = parse_args()
     state_path = args.state_path
@@ -464,6 +621,16 @@ def main() -> int:
     print(f"final={final_root}")
     if args.verify_content:
         print("[mode] deep verify enabled: replay raw fragments and compare merged content")
+    elif args.fast_verify_head > 0:
+        print(
+            f"[mode] fast head verify enabled: compare first {args.fast_verify_head} merged rows "
+            f"per instId/field without full row counting"
+        )
+    elif args.sample_verify > 0:
+        print(
+            f"[mode] sample verify enabled: replay raw count and compare {args.sample_verify} "
+            f"sampled rows per instId/field (seed={args.sample_seed})"
+        )
     else:
         print("[mode] fast verify: state/manifests/merged files only")
 
@@ -474,6 +641,9 @@ def main() -> int:
         selected_inst_ids=selected_inst_ids,
         selected_fields=selected_fields,
         verify_content=args.verify_content,
+        sample_verify=max(0, args.sample_verify),
+        sample_seed=args.sample_seed,
+        fast_verify_head=max(0, args.fast_verify_head),
     )
 
     raw_bytes = directory_size(raw_root)
@@ -483,6 +653,7 @@ def main() -> int:
     print(f"merge_checks={stats['merge_checks']}")
     print(f"raw_input_rows={stats['raw_input_rows']}")
     print(f"merged_rows={stats['merged_rows']}")
+    print(f"state_merged_rows={stats['state_merged_rows']}")
     print(f"raw_bytes={raw_bytes} ({human_bytes(raw_bytes)})")
     print(f"merged_bytes={merged_bytes} ({human_bytes(merged_bytes)})")
 
@@ -496,7 +667,13 @@ def main() -> int:
         f"merge outputs are consistent with current state and merged files; "
         f"manual cleanup candidate: {raw_root} ({human_bytes(raw_bytes)})"
     )
-    if not args.verify_content:
+    if not args.verify_content and args.sample_verify <= 0 and args.fast_verify_head <= 0:
+        print("tip: rerun with --fast-verify-head N for a very fast structural/content spot-check")
+        print("tip: rerun with --sample-verify N for a lightweight replay check")
+        print("tip: rerun with --verify-content before deleting raw if you want the strongest check")
+    elif args.fast_verify_head > 0 and not args.verify_content:
+        print("tip: rerun with --sample-verify N if you also want replayed row-count validation")
+    elif args.sample_verify > 0 and not args.verify_content:
         print("tip: rerun with --verify-content before deleting raw if you want the strongest check")
     return 0
 

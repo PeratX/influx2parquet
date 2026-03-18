@@ -60,3 +60,6 @@ Thumbs.db
 
 # Local rebuilt exporter binary placed at repo root
 /okex_depth_direct
+
+# Local rebuilt exporter binary placed inside the Go module dir
+/go/okex_depth_direct/okex_depth_direct
