@@ -208,7 +208,7 @@ packed binary 的当前布局是：
   在 `merge` 完成后检查 `_merged_go` 是否足够可靠，帮助判断 `_raw_go` 是否可以手动删除。只检查，不删除。
 
 - [python/check_okex_depth_build_against_merged.py](python/check_okex_depth_build_against_merged.py)
-  从 `_merged_go` 重放构造行，并与最终 parquet 做抽样或全量比对，检查 `build` 结果是否和 merged 数据一致。
+  从 `_merged_go` 重放构造行，并与最终 parquet 做前 `N` 行或全量比对；抽样模式同时检查 parquet row count，帮助确认 `build` 结果是否和 merged 数据一致。
 
 - [python/read_okex_depth_compact_parquet.py](python/read_okex_depth_compact_parquet.py)
   读取当前 `okex_depth` 紧凑 Parquet 格式，并按 parquet metadata 里的 scale 把结构化 `asks` / `bids` 重建成文本或 JSON。

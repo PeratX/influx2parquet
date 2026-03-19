@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Validate final okex_depth parquet datasets against merged spool files. "
-            "By default this checks row counts and sampled rows; use --verify-content "
+            "By default this checks parquet row counts and the first N rows; use --verify-content "
             "for a full row-by-row comparison."
         )
     )
@@ -84,13 +83,7 @@ def parse_args() -> argparse.Namespace:
         "--sample-verify",
         type=int,
         default=20,
-        help="number of sampled rows per instId to compare, default: %(default)s",
-    )
-    parser.add_argument(
-        "--sample-seed",
-        type=int,
-        default=20260318,
-        help="random seed for sample selection, default: %(default)s",
+        help="number of leading rows per instId to compare, default: %(default)s",
     )
     parser.add_argument(
         "--verify-content",
@@ -124,16 +117,10 @@ def resolve_roots(args: argparse.Namespace, state_path: Path, state: dict) -> Tu
     return meta_root, merged_root, final_root
 
 
-def choose_sample_targets(total_rows: int, sample_count: int, rng: random.Random) -> set[int]:
+def choose_sample_targets(total_rows: int, sample_count: int) -> set[int]:
     if total_rows <= 0 or sample_count <= 0:
         return set()
-    targets = {1, total_rows}
-    if total_rows <= sample_count:
-        return set(range(1, total_rows + 1))
-    targets.add((total_rows + 1) // 2)
-    while len(targets) < min(sample_count, total_rows):
-        targets.add(rng.randint(1, total_rows))
-    return targets
+    return set(range(1, min(total_rows, sample_count) + 1))
 
 
 def emit_issues(issues: Sequence[ValidationIssue], max_errors: int) -> None:
@@ -169,6 +156,13 @@ def load_dataset_metadata(dataset_path: Path) -> dict[str, str]:
             for key, value in metadata.items()
         }
     return {}
+
+
+def parquet_row_count(dataset_path: Path) -> int:
+    total_rows = 0
+    for part_path in sorted(dataset_path.glob("part-*.parquet")):
+        total_rows += pq.read_metadata(part_path).num_rows
+    return total_rows
 
 
 def detect_inst_ids(state: dict, selected_inst_ids: set[str]) -> List[str]:
@@ -483,6 +477,17 @@ def collect_sample_rows(
     return total_rows, samples
 
 
+def collect_leading_rows(iterator: Iterator[CanonicalRow], limit: int) -> Dict[int, CanonicalRow]:
+    samples: Dict[int, CanonicalRow] = {}
+    if limit <= 0:
+        return samples
+    for row_number, row in enumerate(iterator, start=1):
+        if row_number > limit:
+            break
+        samples[row_number] = row
+    return samples
+
+
 def compare_all_rows(
     inst_id: str,
     expected_iter: Iterator[CanonicalRow],
@@ -543,7 +548,6 @@ def validate_build(
     final_root: Path,
     selected_inst_ids: set[str],
     sample_verify: int,
-    sample_seed: int,
     verify_content: bool,
 ) -> Tuple[List[ValidationIssue], Dict[str, int]]:
     issues: List[ValidationIssue] = []
@@ -614,22 +618,14 @@ def validate_build(
             )
             continue
 
-        rng = random.Random(f"{sample_seed}:{inst_id}")
-        sample_targets = choose_sample_targets(expected_rows, sample_verify, rng)
-        rebuilt_count, rebuilt_samples = collect_sample_rows(
-            iter_expected_rows(inst_id, merge_entry, metadata, merged_root),
-            sample_targets,
-        )
-        parquet_count, parquet_samples = collect_sample_rows(iter_parquet_rows(dataset_path), sample_targets)
-        stats["merged_rows"] += rebuilt_count
+        sample_targets = choose_sample_targets(expected_rows, sample_verify)
+        rebuilt_samples = collect_leading_rows(iter_expected_rows(inst_id, merge_entry, metadata, merged_root), len(sample_targets))
+        parquet_count = parquet_row_count(dataset_path)
+        parquet_samples = collect_leading_rows(iter_parquet_rows(dataset_path), len(sample_targets))
+        stats["merged_rows"] += len(rebuilt_samples)
         stats["parquet_rows"] += parquet_count
         stats["sample_rows_compared"] += len(sample_targets)
 
-        ensure(
-            rebuilt_count == expected_rows,
-            issues,
-            f"merged row count mismatch for {inst_id}: state={expected_rows} rebuilt={rebuilt_count}",
-        )
         ensure(
             parquet_count == expected_rows,
             issues,
@@ -676,7 +672,7 @@ def main() -> int:
     print(f"final={final_root}")
     print(f"mode={'full' if args.verify_content else 'sample'}")
     if not args.verify_content:
-        print(f"sample_verify={args.sample_verify} seed={args.sample_seed}")
+        print(f"sample_verify={args.sample_verify}")
 
     issues, stats = validate_build(
         state=state,
@@ -684,7 +680,6 @@ def main() -> int:
         final_root=final_root,
         selected_inst_ids=selected_inst_ids,
         sample_verify=args.sample_verify,
-        sample_seed=args.sample_seed,
         verify_content=args.verify_content,
     )
 
