@@ -22,6 +22,8 @@ DEFAULT_ROOTS = [
     Path("/mnt/backup_hdd/exported_parallel"),
 ]
 
+GENERIC_ROOT_NAMES = {"exported", "exported_parallel", "parallel_exports", "parquet_output"}
+
 
 @dataclass
 class DatasetStats:
@@ -102,6 +104,14 @@ def read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def dataset_summary(dataset_dir: Path) -> dict[str, Any] | None:
+    for name in ("_summary.json", "summary.json"):
+        payload = read_json(dataset_dir / name)
+        if payload is not None:
+            return payload
+    return None
+
+
 def dataset_part_files(dataset_dir: Path) -> list[Path]:
     return sorted(
         child for child in dataset_dir.iterdir() if child.is_file() and child.suffix == ".parquet"
@@ -128,7 +138,7 @@ def dataset_status(dataset_dir: Path) -> str:
         if bool(checkpoint.get("completed", False)):
             return "completed"
         return "active"
-    if (dataset_dir / "_summary.json").exists():
+    if dataset_summary(dataset_dir) is not None:
         return "completed"
     return "unknown"
 
@@ -147,6 +157,26 @@ def measurement_from_metadata(dataset_dir: Path) -> str | None:
         return None
 
 
+def measurement_from_summary(dataset_dir: Path) -> str | None:
+    summary = dataset_summary(dataset_dir)
+    if summary is None:
+        return None
+    value = summary.get("measurement")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def parent_looks_like_measurement_root(parent: Path, dataset_dir: Path) -> bool:
+    try:
+        siblings = [
+            child for child in parent.iterdir() if child.is_dir() and child.suffix == ".parquet" and child != dataset_dir
+        ]
+    except FileNotFoundError:
+        return False
+    return bool(siblings)
+
+
 def derive_measurement(root: Path, dataset_dir: Path) -> tuple[str, str]:
     try:
         relative = dataset_dir.relative_to(root)
@@ -154,12 +184,23 @@ def derive_measurement(root: Path, dataset_dir: Path) -> tuple[str, str]:
         relative = Path(dataset_dir.name)
 
     parts = relative.parts
+    measured = measurement_from_metadata(dataset_dir) or measurement_from_summary(dataset_dir)
     if not parts:
-        return measurement_from_metadata(dataset_dir) or dataset_dir.stem, dataset_dir.name
+        if measured:
+            return measured, dataset_dir.name
+        parent = dataset_dir.parent
+        if parent_looks_like_measurement_root(parent, dataset_dir):
+            return parent.name, dataset_dir.name
+        return dataset_dir.stem, dataset_dir.name
     if len(parts) == 1:
-        measurement = measurement_from_metadata(dataset_dir) or dataset_dir.stem
+        if measured:
+            measurement = measured
+        elif root.name and root.name not in GENERIC_ROOT_NAMES:
+            measurement = root.name
+        else:
+            measurement = dataset_dir.stem
     elif parts[0].endswith(".parquet"):
-        measurement = measurement_from_metadata(dataset_dir) or Path(parts[0]).stem
+        measurement = measured or Path(parts[0]).stem
     else:
         measurement = parts[0]
     return measurement, str(relative)

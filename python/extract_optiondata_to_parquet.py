@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Export one approved OptionData measurement from InfluxDB to a Parquet dataset."""
+"""Export one OptionData measurement from InfluxDB to a Parquet dataset."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import threading
@@ -71,7 +72,7 @@ def utc_now_iso() -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Export one non-option market-data measurement from the InfluxDB OptionData "
+            "Export one OptionData measurement from the InfluxDB OptionData "
             "database into a resumable compressed Parquet dataset."
         )
     )
@@ -134,6 +135,20 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional exact Influx series key to export, for example "
             "'okex_depth,instId=BTC-USDT-SWAP'. When set, only that single series is exported."
+        ),
+    )
+    parser.add_argument(
+        "--series-tag-key",
+        help=(
+            "Optional tag key used to filter a subset of series keys before export, "
+            "for example 'instrument'. Must be used together with --series-tag-regex."
+        ),
+    )
+    parser.add_argument(
+        "--series-tag-regex",
+        help=(
+            "Regular expression matched against the selected tag value when filtering series, "
+            "for example '^ETH-[0-9]{1,2}SEP22-'. Must be used together with --series-tag-key."
         ),
     )
     parser.add_argument(
@@ -371,6 +386,8 @@ class Checkpoint:
     compression: str
     compression_level: int
     series_key: str | None = None
+    series_tag_key: str | None = None
+    series_tag_regex: str | None = None
     rows_per_file_history: list[int] = field(default_factory=list)
     part_index: int = 0
     rows_written: int = 0
@@ -497,6 +514,10 @@ def summary_path(dataset_path: Path) -> Path:
     return dataset_path / "_summary.json"
 
 
+def part_index_path(dataset_path: Path) -> Path:
+    return dataset_path / "_part_index.json"
+
+
 def save_checkpoint(path: Path, checkpoint: Checkpoint) -> None:
     checkpoint.updated_at = utc_now_iso()
     temp_path = path.with_suffix(".tmp")
@@ -508,6 +529,40 @@ def load_checkpoint(path: Path) -> Checkpoint:
     return Checkpoint(**json.loads(path.read_text(encoding="utf-8")))
 
 
+def load_part_index(dataset_path: Path, measurement: str) -> list[dict[str, Any]]:
+    path = part_index_path(dataset_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError:
+        return []
+
+    if payload.get("measurement") != measurement:
+        return []
+    parts = payload.get("parts", [])
+    if not isinstance(parts, list):
+        return []
+    return [item for item in parts if isinstance(item, dict)]
+
+
+def save_part_index(
+    dataset_path: Path,
+    measurement: str,
+    parts: list[dict[str, Any]],
+) -> None:
+    path = part_index_path(dataset_path)
+    payload = {
+        "measurement": measurement,
+        "dataset_path": str(dataset_path),
+        "generated_at": utc_now_iso(),
+        "parts": parts,
+    }
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(path)
+
+
 def ensure_compatible_checkpoint(checkpoint: Checkpoint, args: argparse.Namespace, dataset_path: Path) -> None:
     current = {
         "measurement": args.measurement,
@@ -517,6 +572,8 @@ def ensure_compatible_checkpoint(checkpoint: Checkpoint, args: argparse.Namespac
         "end": args.end,
         "limit": args.limit,
         "series_key": args.series_key,
+        "series_tag_key": args.series_tag_key,
+        "series_tag_regex": args.series_tag_regex,
     }
     existing = {
         "measurement": checkpoint.measurement,
@@ -526,6 +583,8 @@ def ensure_compatible_checkpoint(checkpoint: Checkpoint, args: argparse.Namespac
         "end": checkpoint.end,
         "limit": checkpoint.limit,
         "series_key": checkpoint.series_key,
+        "series_tag_key": checkpoint.series_tag_key,
+        "series_tag_regex": checkpoint.series_tag_regex,
     }
     if current != existing:
         raise RuntimeError(
@@ -561,6 +620,8 @@ def initialize_checkpoint(args: argparse.Namespace, dataset_path: Path) -> Check
         compression=args.compression,
         compression_level=args.compression_level,
         series_key=args.series_key,
+        series_tag_key=args.series_tag_key,
+        series_tag_regex=args.series_tag_regex,
         rows_per_file_history=[args.rows_per_file],
     )
 
@@ -637,14 +698,42 @@ def build_query_template(measurement: str, start: str | None, end: str | None, l
     return query
 
 
+def build_query_template_for_tag_regex(
+    measurement: str,
+    series_tag_key: str,
+    series_tag_regex: str,
+    start: str | None,
+    end: str | None,
+    limit: int | None,
+) -> str:
+    filters = [f'{quote_ident(series_tag_key)} =~ /{series_tag_regex}/']
+    filters.extend(build_base_time_filters(start, end, None))
+    where_clause = " WHERE " + " AND ".join(filters) if filters else ""
+    query = f"SELECT * FROM {quote_ident(measurement)}{where_clause} ORDER BY time ASC"
+    if limit is not None:
+        query += " LIMIT <remaining-limit>"
+    return query
+
+
 def build_query_template_for_series(
     measurement: str,
     series_key: str | None,
+    series_tag_key: str | None,
+    series_tag_regex: str | None,
     start: str | None,
     end: str | None,
     limit: int | None,
 ) -> str:
     if series_key is None:
+        if series_tag_key is not None and series_tag_regex is not None:
+            return build_query_template_for_tag_regex(
+                measurement,
+                series_tag_key,
+                series_tag_regex,
+                start,
+                end,
+                limit,
+            )
         return build_query_template(measurement, start, end, limit)
 
     _, tags = parse_series_key(series_key)
@@ -655,6 +744,40 @@ def build_query_template_for_series(
     if limit is not None:
         query += f" LIMIT {limit}"
     return query
+
+
+def filter_series_keys(
+    series_keys: list[str],
+    series_key_filter: str | None,
+    series_tag_key_filter: str | None,
+    series_tag_regex_filter: str | None,
+) -> list[str]:
+    if series_key_filter is not None:
+        if series_key_filter not in series_keys:
+            raise RuntimeError(f"Requested series key '{series_key_filter}' was not found.")
+        return [series_key_filter]
+
+    if series_tag_key_filter is None and series_tag_regex_filter is None:
+        return series_keys
+
+    if not series_tag_key_filter or not series_tag_regex_filter:
+        raise RuntimeError("--series-tag-key and --series-tag-regex must be used together.")
+
+    pattern = re.compile(series_tag_regex_filter)
+    filtered: list[str] = []
+    for series_key in series_keys:
+        _, tags = parse_series_key(series_key)
+        tag_value = tags.get(series_tag_key_filter)
+        if tag_value is None:
+            continue
+        if pattern.search(tag_value):
+            filtered.append(series_key)
+
+    if not filtered:
+        raise RuntimeError(
+            f"No series matched tag filter {series_tag_key_filter}=/{series_tag_regex_filter}/."
+        )
+    return filtered
 
 
 def arrow_type_for_column(name: str, field_types: dict[str, str], tag_keys: set[str]) -> pa.DataType:
@@ -678,6 +801,22 @@ def build_schema(measurement: str, field_types: dict[str, str], tag_keys: list[s
         b"database": b"OptionData",
     }
     return schema.with_metadata(metadata)
+
+
+def parquet_dictionary_columns(field_types: dict[str, str], tag_keys: list[str]) -> list[str]:
+    columns = set(tag_keys)
+    columns.update(name for name, field_type in field_types.items() if field_type == "string")
+    return sorted(columns)
+
+
+def parquet_byte_stream_split_columns(schema: pa.Schema) -> list[str]:
+    return sorted(field.name for field in schema if pa.types.is_floating(field.type))
+
+
+def parquet_row_group_size(row_count: int) -> int | None:
+    if row_count <= 0:
+        return None
+    return min(row_count, 250_000)
 
 
 def column_values(values: list[list[Any]], index: int) -> list[Any]:
@@ -753,19 +892,24 @@ def write_part_file(
     tables: list[pa.Table],
     compression: str,
     compression_level: int,
+    dictionary_columns: list[str],
+    byte_stream_split_columns: list[str],
 ) -> tuple[Path, int]:
     final_path = dataset_path / f"part-{part_index:06d}.parquet"
     temp_path = dataset_path / f".part-{part_index:06d}.tmp"
+    combined_table = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
     with pq.ParquetWriter(
         temp_path,
         schema,
         compression=compression,
         compression_level=compression_level,
-        use_dictionary=True,
+        use_dictionary=dictionary_columns or False,
         write_statistics=True,
+        use_byte_stream_split=byte_stream_split_columns or False,
+        data_page_version="2.0",
+        write_batch_size=8192,
     ) as writer:
-        for table in tables:
-            writer.write_table(table)
+        writer.write_table(combined_table, row_group_size=parquet_row_group_size(combined_table.num_rows))
     temp_path.replace(final_path)
     return final_path, final_path.stat().st_size
 
@@ -779,12 +923,15 @@ def write_description_files(
     tag_keys: list[str],
     series_count: int,
     checkpoint: Checkpoint,
+    dictionary_columns: list[str],
+    byte_stream_split_columns: list[str],
 ) -> None:
     description_rows = schema_description_rows(schema, field_types, set(tag_keys))
     rows_per_file_history = checkpoint.rows_per_file_history or [checkpoint.rows_per_file]
     summary = {
         "measurement": measurement,
         "dataset_path": str(dataset_path),
+        "part_index_path": str(part_index_path(dataset_path)),
         "record_count": checkpoint.rows_written,
         "date_range": {
             "min_time_ns": checkpoint.min_time_ns,
@@ -795,6 +942,12 @@ def write_description_files(
         "compression": {
             "codec": checkpoint.compression,
             "level": checkpoint.compression_level,
+        },
+        "encoding": {
+            "dictionary_columns": dictionary_columns,
+            "byte_stream_split_columns": byte_stream_split_columns,
+            "data_page_version": "2.0",
+            "target_row_group_size_rows": 250000,
         },
         "part_count": checkpoint.part_index,
         "dataset_size_bytes": checkpoint.bytes_written,
@@ -813,12 +966,17 @@ def write_description_files(
         "",
         "## Overview",
         f"- Dataset path: `{dataset_path}`",
+        f"- Part index: `{part_index_path(dataset_path).name}`",
         f"- Dataset size: `{human_bytes(checkpoint.bytes_written)}`",
         f"- Part files: `{checkpoint.part_index}`",
         f"- Series count: `{series_count}`",
         f"- Record count: `{checkpoint.rows_written}`",
         f"- Date range: `{ns_to_iso8601(checkpoint.min_time_ns) or 'n/a'}` to `{ns_to_iso8601(checkpoint.max_time_ns) or 'n/a'}`",
         f"- Compression: `{checkpoint.compression}` level `{checkpoint.compression_level}`",
+        f"- Dictionary columns: `{', '.join(dictionary_columns) if dictionary_columns else '-'}`",
+        f"- Byte-stream-split columns: `{', '.join(byte_stream_split_columns) if byte_stream_split_columns else '-'}`",
+        "- Data page version: `2.0`",
+        "- Target row group size: `250000` rows",
         f"- Target rows per part: `{checkpoint.rows_per_file}`",
     ]
     if len(rows_per_file_history) > 1:
@@ -851,6 +1009,8 @@ def export_measurement(
     dataset_path: Path,
     checkpoint: Checkpoint,
     series_key_filter: str | None,
+    series_tag_key_filter: str | None,
+    series_tag_regex_filter: str | None,
     start: str | None,
     end: str | None,
     limit: int | None,
@@ -862,13 +1022,18 @@ def export_measurement(
     field_types = client.field_types(measurement)
     tag_keys = client.tag_keys(measurement)
     schema = build_schema(measurement, field_types, tag_keys)
+    dictionary_columns = parquet_dictionary_columns(field_types, tag_keys)
+    byte_stream_split_columns = parquet_byte_stream_split_columns(schema)
     series_keys = client.show_series_keys(measurement)
-    if series_key_filter is not None:
-        if series_key_filter not in series_keys:
-            raise RuntimeError(
-                f"Requested series key '{series_key_filter}' was not found in measurement '{measurement}'."
-            )
-        series_keys = [series_key_filter]
+    try:
+        series_keys = filter_series_keys(
+            series_keys,
+            series_key_filter=series_key_filter,
+            series_tag_key_filter=series_tag_key_filter,
+            series_tag_regex_filter=series_tag_regex_filter,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"{exc} Measurement='{measurement}'.") from exc
 
     if not series_keys:
         checkpoint.completed = True
@@ -908,33 +1073,106 @@ def export_measurement(
 
     completed_series = list(checkpoint.completed_series)
     completed_series_set = set(completed_series)
+    part_records = load_part_index(dataset_path, measurement)
+    if not part_records and checkpoint.part_index > 0:
+        for part_file in sorted(dataset_path.glob("part-*.parquet")):
+            try:
+                part_number = int(part_file.stem.split("-")[1])
+            except (IndexError, ValueError):
+                continue
+            part_records.append(
+                {
+                    "part_index": part_number,
+                    "file": part_file.name,
+                    "rows": None,
+                    "chunks": None,
+                    "bytes": part_file.stat().st_size,
+                    "min_time_ns": None,
+                    "max_time_ns": None,
+                    "min_time": None,
+                    "max_time": None,
+                    "series_keys": [],
+                    "tag_values": {},
+                    "note": "part predates _part_index metadata",
+                }
+            )
     buffer_tables: list[pa.Table] = []
+    buffer_series_keys: set[str] = set()
+    buffer_tag_values: dict[str, set[str]] = {}
     buffer_rows = 0
     buffer_chunks = 0
     buffer_min_time_ns: int | None = None
     buffer_max_time_ns: int | None = None
     current_series_key: str | None = None
     status = "exported"
+    cross_series_buffering = series_tag_key_filter is not None and series_key_filter is None
+    buffered_completed_series: list[str] = []
 
-    def flush_buffer() -> None:
-        nonlocal buffer_tables, buffer_rows, buffer_chunks, buffer_min_time_ns, buffer_max_time_ns
+    def mark_series_completed(series_key: str) -> None:
+        if series_key in completed_series_set:
+            return
+        completed_series.append(series_key)
+        completed_series_set.add(series_key)
+        checkpoint.completed_series = completed_series
+
+    def persist_buffered_completed_series() -> None:
+        nonlocal buffered_completed_series
+        if not buffered_completed_series:
+            return
+        for series_key in buffered_completed_series:
+            mark_series_completed(series_key)
+        buffered_completed_series = []
+
+    def flush_buffer(complete_current_series: bool = False) -> None:
+        nonlocal buffer_tables, buffer_series_keys, buffer_tag_values
+        nonlocal buffer_rows, buffer_chunks, buffer_min_time_ns, buffer_max_time_ns
         if not buffer_tables or current_series_key is None:
+            if complete_current_series and current_series_key is not None:
+                mark_series_completed(current_series_key)
+                checkpoint.active_series = None
+                checkpoint.active_series_last_time_ns = None
+                save_checkpoint(checkpoint_path(dataset_path), checkpoint)
             return
 
+        part_index = checkpoint.part_index
         _, bytes_written = write_part_file(
             dataset_path=dataset_path,
-            part_index=checkpoint.part_index,
+            part_index=part_index,
             schema=schema,
             tables=buffer_tables,
             compression=compression,
             compression_level=compression_level,
+            dictionary_columns=dictionary_columns,
+            byte_stream_split_columns=byte_stream_split_columns,
+        )
+        part_records.append(
+            {
+                "part_index": part_index,
+                "file": f"part-{part_index:06d}.parquet",
+                "rows": buffer_rows,
+                "chunks": buffer_chunks,
+                "bytes": bytes_written,
+                "min_time_ns": buffer_min_time_ns,
+                "max_time_ns": buffer_max_time_ns,
+                "min_time": ns_to_iso8601(buffer_min_time_ns),
+                "max_time": ns_to_iso8601(buffer_max_time_ns),
+                "series_keys": sorted(buffer_series_keys),
+                "tag_values": {
+                    key: sorted(values)
+                    for key, values in sorted(buffer_tag_values.items())
+                },
+            }
         )
         checkpoint.part_index += 1
         checkpoint.rows_written += buffer_rows
         checkpoint.chunks_flushed += buffer_chunks
         checkpoint.bytes_written += bytes_written
-        checkpoint.active_series = current_series_key
-        checkpoint.active_series_last_time_ns = buffer_max_time_ns
+        if complete_current_series:
+            checkpoint.active_series = None
+            checkpoint.active_series_last_time_ns = None
+        else:
+            checkpoint.active_series = current_series_key
+            checkpoint.active_series_last_time_ns = buffer_max_time_ns
         if buffer_min_time_ns is not None and (
             checkpoint.min_time_ns is None or buffer_min_time_ns < checkpoint.min_time_ns
         ):
@@ -943,9 +1181,15 @@ def export_measurement(
             checkpoint.max_time_ns is None or buffer_max_time_ns > checkpoint.max_time_ns
         ):
             checkpoint.max_time_ns = buffer_max_time_ns
+        persist_buffered_completed_series()
+        if complete_current_series:
+            mark_series_completed(current_series_key)
         save_checkpoint(checkpoint_path(dataset_path), checkpoint)
+        save_part_index(dataset_path, measurement, part_records)
         progress.note_flush(buffer_rows, buffer_chunks, bytes_written, current_series_key)
         buffer_tables = []
+        buffer_series_keys = set()
+        buffer_tag_values = {}
         buffer_rows = 0
         buffer_chunks = 0
         buffer_min_time_ns = None
@@ -956,6 +1200,7 @@ def export_measurement(
             if series_key in completed_series_set:
                 continue
 
+            _, series_tags = parse_series_key(series_key)
             remaining_limit = None if limit is None else max(limit - checkpoint.rows_written - buffer_rows, 0)
             if remaining_limit == 0:
                 break
@@ -982,6 +1227,9 @@ def export_measurement(
                         continue
                     min_time_ns, max_time_ns = extract_series_time_range(series)
                     buffer_tables.append(table)
+                    buffer_series_keys.add(series_key)
+                    for tag_key, tag_value in series_tags.items():
+                        buffer_tag_values.setdefault(tag_key, set()).add(tag_value)
                     buffer_rows += table.num_rows
                     buffer_chunks += 1
                     if min_time_ns is not None and (
@@ -996,13 +1244,16 @@ def export_measurement(
                     if buffer_rows >= rows_per_file:
                         flush_buffer()
 
-            flush_buffer()
-            checkpoint.active_series = None
-            checkpoint.active_series_last_time_ns = None
-            completed_series.append(series_key)
-            completed_series_set.add(series_key)
-            checkpoint.completed_series = completed_series
-            save_checkpoint(checkpoint_path(dataset_path), checkpoint)
+            if cross_series_buffering:
+                if series_key in buffer_series_keys:
+                    buffered_completed_series.append(series_key)
+                else:
+                    mark_series_completed(series_key)
+                    checkpoint.active_series = None
+                    checkpoint.active_series_last_time_ns = None
+                    save_checkpoint(checkpoint_path(dataset_path), checkpoint)
+            else:
+                flush_buffer(complete_current_series=True)
             progress.note_series_complete()
 
     except KeyboardInterrupt:
@@ -1030,11 +1281,20 @@ def export_measurement(
             "max_time": ns_to_iso8601(checkpoint.max_time_ns),
         }
 
+    flush_buffer(complete_current_series=True)
     checkpoint.completed = True
     checkpoint.active_series = None
     checkpoint.active_series_last_time_ns = None
     save_checkpoint(checkpoint_path(dataset_path), checkpoint)
-    query_template = build_query_template_for_series(measurement, series_key_filter, start, end, limit)
+    query_template = build_query_template_for_series(
+        measurement,
+        series_key_filter,
+        series_tag_key_filter,
+        series_tag_regex_filter,
+        start,
+        end,
+        limit,
+    )
     write_description_files(
         dataset_path=dataset_path,
         measurement=measurement,
@@ -1044,6 +1304,8 @@ def export_measurement(
         tag_keys=tag_keys,
         series_count=len(series_keys),
         checkpoint=checkpoint,
+        dictionary_columns=dictionary_columns,
+        byte_stream_split_columns=byte_stream_split_columns,
     )
     return {
         "measurement": measurement,
@@ -1059,6 +1321,13 @@ def export_measurement(
 
 def main() -> int:
     args = parse_args()
+
+    if bool(args.series_tag_key) != bool(args.series_tag_regex):
+        print("--series-tag-key and --series-tag-regex must be used together.", file=sys.stderr)
+        return 2
+    if args.series_key and args.series_tag_key:
+        print("--series-key cannot be combined with --series-tag-key/--series-tag-regex.", file=sys.stderr)
+        return 2
 
     if args.measurement in EXCLUDED_MEASUREMENTS and not args.allow_excluded:
         print(
@@ -1086,7 +1355,7 @@ def main() -> int:
     if checkpoint.completed:
         print(
             f"[resume] measurement={args.measurement} "
-            f"series={args.series_key or '-'} checkpoint=completed",
+            f"series={args.series_key or (f'{args.series_tag_key}=/{args.series_tag_regex}/' if args.series_tag_key else '-')} checkpoint=completed",
             flush=True,
         )
     elif checkpoint.rows_written > 0 or checkpoint.part_index > 0 or checkpoint.active_series:
@@ -1094,13 +1363,14 @@ def main() -> int:
             "[resume] "
             f"measurement={args.measurement} rows={checkpoint.rows_written} "
             f"parts={checkpoint.part_index} "
-            f"series={args.series_key or '-'} "
+            f"series={args.series_key or (f'{args.series_tag_key}=/{args.series_tag_regex}/' if args.series_tag_key else '-')} "
             f"active_series={checkpoint.active_series or '-'}",
             flush=True,
         )
     else:
         print(
-            f"[start] measurement={args.measurement} series={args.series_key or '-'}",
+            f"[start] measurement={args.measurement} "
+            f"series={args.series_key or (f'{args.series_tag_key}=/{args.series_tag_regex}/' if args.series_tag_key else '-')}",
             flush=True,
         )
 
@@ -1110,6 +1380,8 @@ def main() -> int:
         dataset_path=dataset_path,
         checkpoint=checkpoint,
         series_key_filter=args.series_key,
+        series_tag_key_filter=args.series_tag_key,
+        series_tag_regex_filter=args.series_tag_regex,
         start=args.start,
         end=args.end,
         limit=args.limit,

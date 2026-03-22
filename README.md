@@ -198,6 +198,13 @@ packed binary 的当前布局是：
 - [python/export_parallel_instid.py](python/export_parallel_instid.py)
   把 `okex_depth` 或 `binance_depth20` 按 `instId` 拆成多个 worker 并发跑。仍然基于 Python HTTP 导出器，不是 direct TSM。
 
+- [python/export_parallel_series.py](python/export_parallel_series.py)
+  面向任意 measurement 的通用并行导出器。会自动识别合适的高基数 tag，例如 `instId`、`instrument`、`symbol`，并按该 tag 的每个值拆成独立 worker 数据集。
+  对 `deribit_option` 这类 Deribit 风格合约，还支持 `--group-by instrument-month`，把
+  `ETH-9SEP22-1500-C`、`ETH-16SEP22-1500-P` 这类合约归并成 `ETH-SEP22`
+  这样的 shard，再由每个 shard 启一个 worker，避免按完整 `instrument`
+  分得过碎。
+
 - [python/export_okex_depth_tsm.py](python/export_okex_depth_tsm.py)
   旧版 direct-TSM `okex_depth` 流水线。支持 `scan/export/merge/build` 四阶段，原始和合并中间层是 `.tsv.zst`。
 
@@ -255,6 +262,55 @@ packed binary 的当前布局是：
   主要放并发导出和 `okex_depth` 流水线产物。
 
 `okex_depth` 常见状态文件：
+
+## Option Measurement 并行导出
+
+对于 option / binary-option / prediction-market 相关 measurement，推荐优先使用：
+
+- [python/export_parallel_series.py](python/export_parallel_series.py)
+
+脚本默认会自动挑一个高基数 tag 来分片，例如：
+
+- `instId`
+- `instrument`
+- `symbol`
+
+也就是说，像 `predict_product_price` 这类表，默认就会按每个 `instId` 启一个 worker。
+
+对 `deribit_option`，如果直接按完整 `instrument` 分片，会碎成很多小任务，因此更推荐：
+
+```bash
+/home/niko/influx2parquet/.venv/bin/python \
+  /home/niko/influx2parquet/python/export_parallel_series.py \
+  deribit_option \
+  --allow-excluded \
+  --group-by instrument-month \
+  --workers 8 \
+  --output-dir /mnt/backup_hdd/exported_parallel
+```
+
+这会把合约按 `标的 + 到期月份` 分成 shard，例如：
+
+- `BTC-SEP22`
+- `BTC-OCT22`
+- `ETH-SEP22`
+
+每个 shard dataset 还会额外写一份 `_part_index.json`，记录：
+
+- 每个 `part-xxxxxx.parquet`
+- 包含了哪些 `instrument` / `instId` / `symbol`
+- 该 part 的时间范围、行数和字节数
+
+如果只想先看脚本会切出哪些 shard，而不真正启动导出，可以先跑：
+
+```bash
+/home/niko/influx2parquet/.venv/bin/python \
+  /home/niko/influx2parquet/python/export_parallel_series.py \
+  deribit_option \
+  --allow-excluded \
+  --group-by instrument-month \
+  --list-shards
+```
 
 - `_pipeline_state_go.json`
   Go 流水线状态。
